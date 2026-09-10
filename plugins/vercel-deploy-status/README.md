@@ -166,10 +166,14 @@ hooks/queue.ts            everything with no UI in it: types, the wake regex,
 test/queue.test.mts       52 checks on queue.ts, on bare Node
 ```
 
-Two rules of this runtime's JSX, learned the hard way and marked in the code:
-a `.map()` array is not a valid `Box` child, so wrap it in a Fragment; and
-`key` is a `Button` prop only, so a `Box` with a `key` fails validation and
-the whole tree falls back in silence.
+Three rules of this runtime, learned the hard way and marked in the code:
+a `.map()` array is not a valid `Box` child, so wrap it in a Fragment; `key`
+is a `Button` prop only, so a `Box` with a `key` fails validation and the
+whole tree falls back in silence; and nothing inside a hook may be named
+`next`. `next` is the continuation each hook is handed, and a local of that
+name shadows it, which the loader refuses. The module then registers no hook
+at all, so the plugin is silent rather than wrong. `claude plugin validate`
+catches it, and `--debug-file` names it.
 
 ## Test it
 

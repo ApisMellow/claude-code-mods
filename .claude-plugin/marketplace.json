@@ -7,7 +7,7 @@
   },
   "metadata": {
     "description": "Claude Code function hooks that are worth installing.",
-    "version": "1.1.0"
+    "version": "1.1.1"
   },
   "plugins": [
     {
@@ -24,7 +24,7 @@
       "name": "vercel-deploy-status",
       "source": "./plugins/vercel-deploy-status",
       "description": "Pins the Vercel deploy queue of the linked project under the prompt: every deploy queued, building or just finished, with its phase and elapsed time",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": { "name": "Ray Amjad" },
       "category": "productivity",
       "keywords": ["vercel", "deploy", "status", "ui"],

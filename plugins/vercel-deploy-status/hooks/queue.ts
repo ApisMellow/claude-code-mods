@@ -132,30 +132,35 @@ export type Merge = {
 // A deploy that was in flight and is not any more keeps its line for holdMs
 // with its final state. One that fell off the list has finished, and Ready is
 // the usual way, so it is shown as Ready.
+//
+// The local is `nextRows`, not `next`, on purpose. This function is pure and
+// could live in the hook module, and there `next` is the continuation every
+// hook is handed. A local of that name shadows it and the whole module is
+// refused at load, with no hook registered. Keep the name free everywhere.
 export function merge(rows: Row[], list: Deployment[], now: number, holdMs: number): Merge {
   const known = new Set(rows.map((r) => r.d.url))
-  const next: Row[] = []
+  const nextRows: Row[] = []
   const started: Deployment[] = []
   const finished: Deployment[] = []
 
   for (const d of list) {
     if (!IN_FLIGHT.has(d.state)) continue
     if (!known.has(d.url)) started.push(d)
-    next.push({ d, finishedAt: null })
+    nextRows.push({ d, finishedAt: null })
   }
 
   for (const r of rows) {
-    if (next.some((n) => n.d.url === r.d.url)) continue
+    if (nextRows.some((n) => n.d.url === r.d.url)) continue
     if (IN_FLIGHT.has(r.d.state)) {
       const final = list.find((d) => d.url === r.d.url)
       const d: Deployment = final && !IN_FLIGHT.has(final.state) ? final : { ...r.d, state: 'READY' }
       finished.push(d)
-      next.push({ d, finishedAt: now })
+      nextRows.push({ d, finishedAt: now })
     } else if (r.finishedAt !== null && now - r.finishedAt <= holdMs) {
-      next.push(r)
+      nextRows.push(r)
     }
   }
 
-  next.sort((a, b) => b.d.createdAt - a.d.createdAt)
-  return { rows: next, started, finished }
+  nextRows.sort((a, b) => b.d.createdAt - a.d.createdAt)
+  return { rows: nextRows, started, finished }
 }
