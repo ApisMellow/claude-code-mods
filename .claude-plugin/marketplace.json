@@ -14,7 +14,7 @@
       "name": "secret-redactor",
       "source": "./plugins/secret-redactor",
       "description": "Keeps secrets, email addresses and IP addresses out of the session transcript, and puts the real value back on the way into a tool call",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": { "name": "Ray Amjad" },
       "category": "security",
       "keywords": ["security", "secrets", "redaction", "pii"],

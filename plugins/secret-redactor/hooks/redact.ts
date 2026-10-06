@@ -5,10 +5,10 @@ import type { Register, PromptContextBlock } from 'claude-code'
 //
 // The value is not deleted. It is put in a vault that lives in this module,
 // in memory, for the session, and the transcript gets a placeholder in its
-// place: `[REDACTED-SECRET-1a2b3c4d]`. The same value always mints the same
-// placeholder, so the model can still tell one customer from another, and
-// the placeholder is swapped back for the real value on the way into a tool
-// call, so a `Bash` command or a `Write` still carries the real key.
+// place: `[REDACTED-SECRET-1a2b3c4d]`. Within a session the same value always
+// mints the same placeholder, so the model can still tell one customer from
+// another, and the placeholder is swapped back for the real value on the way
+// into a tool call, so a `Bash` command or a `Write` still carries the real key.
 //
 // Nothing is written to disk. The vault dies with the session.
 
@@ -37,20 +37,23 @@ let hidden = 0
 
 const TAG = /\[REDACTED-(?:SECRET|EMAIL|IP)-[0-9a-f]{8}\]/g
 
-function fnv1a(text: string): string {
-  let h = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i)
-    h = Math.imul(h, 0x01000193) >>> 0
-  }
-  return h.toString(16).padStart(8, '0')
+// A tag is random, not derived from its value: a hash of the value would let
+// anyone holding a screenshot confirm a guessed email or IP against it.
+function randomHex8(): string {
+  const bytes = new Uint8Array(4)
+  const crypto = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto
+  if (crypto?.getRandomValues) crypto.getRandomValues(bytes)
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 function mint(kind: Kind, value: string): string {
   hidden++
   const seen = byValue.get(value)
   if (seen) return seen
-  const tag = `[REDACTED-${kind}-${fnv1a(value)}]`
+  let tag: string
+  do tag = `[REDACTED-${kind}-${randomHex8()}]`
+  while (byTag.has(tag))
   byValue.set(value, tag)
   byTag.set(tag, value)
   return tag

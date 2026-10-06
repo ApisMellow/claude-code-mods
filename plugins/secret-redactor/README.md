@@ -21,8 +21,11 @@ SUPPORT_EMAIL=[REDACTED-EMAIL-6f096ff7]
 EDGE_ORIGIN=[REDACTED-IP-6fc52d2b]
 ```
 
-The same value always mints the same placeholder, so the model can still tell
-one customer from another. The placeholder is swapped back for the real value
+Within a session the same value always mints the same placeholder, so the
+model can still tell one customer from another. The tag is random, not a hash
+of the value, so a screenshot of a placeholder can't be checked against a
+guessed email or IP, and the same value gets a different tag in the next
+session. The placeholder is swapped back for the real value
 on the way into a tool call, so a `Bash` command or a `Write` still carries the
 real key. Nothing is written to disk. The vault dies with the session.
 

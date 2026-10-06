@@ -79,5 +79,29 @@ if (restore(scrub(line)) !== line) {
   console.log('LOSS  a placeholder did not buy its value back')
 }
 
+// A placeholder is keyed to its session: its tag can't be checked against a
+// guessed value, and the same value gets a different tag in another session.
+// Importing the module again under a new URL stands in for a new session.
+const unkeyed = (text: string): string => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+const ip = '91.198.174.192'
+const here = scrub(ip)
+if (here.includes(unkeyed(ip))) {
+  bad++
+  console.log(`GUESSABLE  ${here} is the bare hash of ${ip}`)
+}
+const next = await import('../hooks/redact.ts?session=2')
+const nextCfg = next.makeConfig({})
+if (next.scrubPii(next.scrubSecrets(ip, nextCfg), nextCfg) === here) {
+  bad++
+  console.log(`LINKABLE  ${here} is the same tag in a new session`)
+}
+
 console.log(bad === 0 ? `ok  ${HIDE.length} hidden, ${KEEP.length} kept, round trip clean` : `${bad} failure(s)`)
 if (bad > 0) process.exitCode = 1
