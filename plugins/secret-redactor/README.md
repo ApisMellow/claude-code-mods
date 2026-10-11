@@ -70,7 +70,8 @@ two hits across its whole tracked source tree, and both are real secrets.
   documentation domains (`@example.com`, `@company.com`, `@test`),
   placeholder local parts (`you@`, `name@`, `admin@`), and anything in
   `allowEmails`. Put your own published addresses in that option, as
-  `@yourdomain.com`, so your own contact address stays readable.
+  `@yourdomain.com`, so your own contact address stays readable. To keep
+  every address readable and still hide IPs, turn `hideEmails` off.
 - **IP addresses**, v4 and v6. Private and reserved ranges stay visible by
   default, because `127.0.0.1:3000` is everywhere in dev: loopback, `10.x`,
   `192.168.x`, `172.16-31.x`, link-local, carrier-grade NAT, multicast, the
@@ -85,6 +86,7 @@ Set them per plugin under `pluginConfigs` in your **user** settings.
 | --- | --- | --- |
 | `secrets` | `true` | Hide secrets |
 | `pii` | `true` | Hide emails and IP addresses |
+| `hideEmails` | `true` | With `pii` on, hide emails too. Off hides IP addresses only |
 | `restoreInToolInputs` | `true` | Put the real value back before a tool runs |
 | `notify` | `true` | Count on the tool row, toast on a prompt |
 | `minEntropy` | `3.6` | Bits per character for the mixed-case test |

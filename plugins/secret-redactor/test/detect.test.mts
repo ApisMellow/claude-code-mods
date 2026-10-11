@@ -79,5 +79,17 @@ if (restore(scrub(line)) !== line) {
   console.log('LOSS  a placeholder did not buy its value back')
 }
 
+// hideEmails off: addresses stay readable, public IPs are still hidden.
+const ipsOnly = makeConfig({ hideEmails: false })
+const address = 'contact me at dana.whitfield@northwind-labs.io'
+if (scrubPii(address, ipsOnly) !== address) {
+  bad++
+  console.log('FALSE POSITIVE  hideEmails off still hid an address')
+}
+if (scrubPii('origin 8.8.8.8 hit the worker', ipsOnly) === 'origin 8.8.8.8 hit the worker') {
+  bad++
+  console.log('MISS  hideEmails off stopped hiding public IPs')
+}
+
 console.log(bad === 0 ? `ok  ${HIDE.length} hidden, ${KEEP.length} kept, round trip clean` : `${bad} failure(s)`)
 if (bad > 0) process.exitCode = 1

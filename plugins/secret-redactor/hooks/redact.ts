@@ -17,6 +17,7 @@ type Kind = 'SECRET' | 'EMAIL' | 'IP'
 export type Config = {
   secrets: boolean
   pii: boolean
+  emails: boolean
   restore: boolean
   notify: boolean
   minEntropy: number
@@ -241,7 +242,7 @@ function allowedEmail(address: string, cfg: Config): boolean {
 
 export function scrubPii(text: string, cfg: Config): string {
   let out = text
-  out = out.replace(EMAIL, (m) => (allowedEmail(m, cfg) || cfg.allow.has(m) ? m : mint('EMAIL', m)))
+  if (cfg.emails) out = out.replace(EMAIL, (m) => (allowedEmail(m, cfg) || cfg.allow.has(m) ? m : mint('EMAIL', m)))
   out = out.replace(IPV4, (m) => {
     if (cfg.allow.has(m)) return m
     if (!cfg.privateIps && isPrivateV4(m)) return m
@@ -302,6 +303,7 @@ export function makeConfig(options: Record<string, unknown>): Config {
   return {
     secrets: bool(options.secrets, true),
     pii: bool(options.pii, true),
+    emails: bool(options.hideEmails, true),
     restore: bool(options.restoreInToolInputs, true),
     notify: bool(options.notify, true),
     minEntropy: num(options.minEntropy, 3.6),
