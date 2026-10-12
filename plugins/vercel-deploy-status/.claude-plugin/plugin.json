@@ -6,7 +6,7 @@
   "author": {
     "name": "Ray Amjad"
   },
-  "homepage": "https://github.com/ray-amjad/awesome-claude-code-function-hooks",
+  "homepage": "https://github.com/ray-amjad/claude-code-mods/tree/main/plugins/vercel-deploy-status",
   "license": "MIT",
   "keywords": ["vercel", "deploy", "status", "ui", "function-hooks"],
   "userConfig": {

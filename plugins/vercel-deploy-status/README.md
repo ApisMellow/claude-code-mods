@@ -4,17 +4,17 @@ Pins the Vercel deploy queue of the linked project under the prompt. Every
 deploy that is queued, building or just finished gets one line, with its
 phase, its target, its branch, how long it has run, and the commit subject.
 
-> **Turn function hooks on first.** This is a Claude Code **function hook**,
-> the early-access feature proposed in
-> [anthropics/claude-code#91870](https://github.com/anthropics/claude-code/issues/91870).
-> It is off by default, and this plugin does nothing until you turn it on. Add
-> `"env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }` to
-> `~/.claude/settings.json`, or start one session with
-> `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude`.
-
 It never starts a turn and never writes to the transcript. It polls the
 `vercel` CLI on your machine and draws the answer. You keep working, and the
 deploy sits in the corner of your eye.
+
+## Install
+
+```
+/plugin install vercel-deploy-status --marketplace ray-amjad/claude-code-mods
+```
+
+Answer `y` to add the marketplace, then pick a scope.
 
 ## What it looks like
 
@@ -125,7 +125,7 @@ is not read.
 ```json
 {
   "pluginConfigs": {
-    "vercel-deploy-status@awesome-claude-code-function-hooks": {
+    "vercel-deploy-status@claude-code-mods": {
       "options": {
         "activePollSeconds": 10,
         "holdFinishedMinutes": 10

@@ -1,0 +1,8 @@
+{
+  "name": "cache-clock",
+  "version": "0.2.0",
+  "description": "A one-line band above the prompt: context used, and a countdown until the prompt cache goes cold",
+  "author": { "name": "Ray Amjad", "url": "https://github.com/ray-amjad" },
+  "repository": "https://github.com/ray-amjad/claude-code-mods/tree/main/plugins/cache-clock",
+  "license": "MIT"
+}
