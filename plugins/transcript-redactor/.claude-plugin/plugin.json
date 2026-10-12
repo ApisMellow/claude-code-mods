@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "transcript-redactor",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Keeps secrets and email addresses out of the session transcript: swaps each one for a stable placeholder on the way in, and puts the real value back on the way into a tool call",
   "author": {
     "name": "Ray Amjad",
@@ -16,8 +16,20 @@
     },
     "pii": {
       "type": "boolean",
-      "title": "Hide email addresses",
-      "description": "Hide email addresses",
+      "title": "Hide personal information",
+      "description": "Hide email addresses and public IP addresses",
+      "default": false
+    },
+    "hideEmails": {
+      "type": "boolean",
+      "title": "Hide emails",
+      "description": "With pii on, also hide email addresses. Turn off to hide only IP addresses",
+      "default": true
+    },
+    "redactPrivateIps": {
+      "type": "boolean",
+      "title": "Hide private IP addresses",
+      "description": "With pii on, also hide private and reserved IP addresses recognized by the detector",
       "default": false
     },
     "restoreInToolInputs": {
@@ -54,7 +66,7 @@
       "type": "number",
       "title": "Entropy floor next to a key name",
       "description": "The floor used when the token sits after API_KEY=, \"token\":, Bearer and the like",
-      "default": 3.0
+      "default": 3
     },
     "allow": {
       "type": "string",

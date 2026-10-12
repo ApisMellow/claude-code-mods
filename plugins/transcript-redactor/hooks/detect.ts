@@ -2,10 +2,6 @@
 // and the walkers. Nothing in here touches `$` or registers a hook, so another
 // mod can vendor this file as it is and the tests can run it under plain node.
 //
-// Two classes of value are kept out of the transcript: secrets and email
-// addresses. IP addresses are left alone on purpose: they are not worth the
-// noise.
-//
 // The value is not deleted. It is put in a vault that lives in this module,
 // in memory, for the session, and the transcript gets a placeholder in its
 // place: `[REDACTED-SECRET-1a2b3c4d]`. Within one session the same value always
@@ -16,11 +12,13 @@
 //
 // Nothing is written to disk. The vault dies with the session.
 
-export type Kind = 'SECRET' | 'EMAIL' | 'LITERAL'
+export type Kind = 'SECRET' | 'EMAIL' | 'IP' | 'LITERAL'
 
 export type Config = {
   secrets: boolean
   pii: boolean
+  emails: boolean
+  privateIps: boolean
   restore: boolean
   restoreTools: ReadonlySet<string>
   notify: boolean
@@ -46,61 +44,20 @@ const byTag = new Map<string, string>()
 let hidden = 0
 let minted: Set<string> | null = null
 
-const TAG = /\[REDACTED-(?:SECRET|EMAIL|LITERAL)-[0-9a-f]{8}\]/g
-const WHOLE_TAG = /^\[REDACTED-(?:SECRET|EMAIL|LITERAL)-[0-9a-f]{8}\]$/
+const TAG = /\[REDACTED-(?:SECRET|EMAIL|IP|LITERAL)-[0-9a-f]{8}\]/g
+const WHOLE_TAG = /^\[REDACTED-(?:SECRET|EMAIL|IP|LITERAL)-[0-9a-f]{8}\]$/
 
-// The tag is a keyed hash, and the key is drawn fresh for every session. So
-// nobody can work out a value from its tag, and a crafted token cannot be
-// aimed at a placeholder that is already on screen.
-const KEY = sessionKey()
-
-function sessionKey(): [number, number] {
-  const words = new Uint32Array(2)
-  const c = (globalThis as { crypto?: { getRandomValues?: (a: Uint32Array) => Uint32Array } }).crypto
-  if (c?.getRandomValues) c.getRandomValues(words)
-  else for (let i = 0; i < 2; i++) words[i] = Math.floor(Math.random() * 2 ** 32)
-  return [words[0]!, words[1]!]
-}
-
-const encoder = new TextEncoder()
-
-function rotl(x: number, b: number): number {
-  return ((x << b) | (x >>> (32 - b))) >>> 0
-}
-
-// HalfSipHash-2-4: a small keyed hash with a 32-bit answer, which is the
-// 8 hex characters the placeholder shows.
-function keyedHash(text: string): string {
-  const bytes = encoder.encode(text)
-  let v0 = KEY[0]
-  let v1 = KEY[1]
-  let v2 = (0x6c796765 ^ KEY[0]) >>> 0
-  let v3 = (0x74656462 ^ KEY[1]) >>> 0
-  const round = (): void => {
-    v0 = (v0 + v1) >>> 0; v1 = rotl(v1, 5); v1 = (v1 ^ v0) >>> 0; v0 = rotl(v0, 16)
-    v2 = (v2 + v3) >>> 0; v3 = rotl(v3, 8); v3 = (v3 ^ v2) >>> 0
-    v0 = (v0 + v3) >>> 0; v3 = rotl(v3, 7); v3 = (v3 ^ v0) >>> 0
-    v2 = (v2 + v1) >>> 0; v1 = rotl(v1, 13); v1 = (v1 ^ v2) >>> 0; v2 = rotl(v2, 16)
-  }
-  const whole = bytes.length - (bytes.length % 4)
-  for (let i = 0; i < whole; i += 4) {
-    const m = (bytes[i]! | (bytes[i + 1]! << 8) | (bytes[i + 2]! << 16) | (bytes[i + 3]! << 24)) >>> 0
-    v3 = (v3 ^ m) >>> 0; round(); round(); v0 = (v0 ^ m) >>> 0
-  }
-  let last = (bytes.length & 0xff) << 24
-  for (let i = whole, s = 0; i < bytes.length; i++, s += 8) last |= bytes[i]! << s
-  last >>>= 0
-  v3 = (v3 ^ last) >>> 0; round(); round(); v0 = (v0 ^ last) >>> 0
-  v2 = (v2 ^ 0xff) >>> 0
-  round(); round(); round(); round()
-  return ((v1 ^ v3) >>> 0).toString(16).padStart(8, '0')
+function randomHex8(): string {
+  const bytes = new Uint8Array(4)
+  const crypto = (globalThis as { crypto?: { getRandomValues?: (values: Uint8Array) => Uint8Array } }).crypto
+  if (crypto?.getRandomValues) crypto.getRandomValues(bytes)
+  else for (let index = 0; index < bytes.length; index++) bytes[index] = Math.floor(Math.random() * 256)
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 // Swaps a value for its placeholder and remembers both. A value that already
 // holds a placeholder from an earlier pass (a key inside a URL password) is
 // stored with that placeholder put back, so one restore gives the real text.
-// Two different values never share a placeholder: on a clash the hash is
-// taken again with a counter until the tag is free.
 export function mint(kind: Kind, raw: string): string {
   hidden++
   const value = kind === 'LITERAL' ? raw : restore(unpark(raw))
@@ -110,11 +67,9 @@ export function mint(kind: Kind, raw: string): string {
     minted?.add(seen)
     return seen
   }
-  let tag = ''
-  for (let i = 0; ; i++) {
-    tag = `[REDACTED-${kind}-${keyedHash(`${kind}\u0000${i}\u0000${value}`)}]`
-    if (!byTag.has(tag)) break
-  }
+  let tag: string
+  do tag = `[REDACTED-${kind}-${randomHex8()}]`
+  while (byTag.has(tag))
   byValue.set(value, tag)
   byTag.set(tag, value)
   if (kind === 'SECRET') remember(value)
@@ -1531,9 +1486,40 @@ function allowedEmail(address: string, cfg: Config): boolean {
   })
 }
 
+const OCTET = '(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+const IPV4 = new RegExp('(?<![0-9.])(?:' + OCTET + '\\.){3}' + OCTET + '(?![0-9.])', 'g')
+const IPV6 = /(?<![0-9A-Za-z:])(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}(?![0-9A-Za-z:])/g
+
+function isPrivateV4(ip: string): boolean {
+  const parts = ip.split('.').map(Number)
+  if (parts[0] === 10 || parts[0] === 127 || parts[0] === 0) return true
+  if (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31) return true
+  if (parts[0] === 192 && parts[1] === 168) return true
+  if (parts[0] === 169 && parts[1] === 254) return true
+  if (parts[0] === 100 && parts[1]! >= 64 && parts[1]! <= 127) return true
+  if (parts[0]! >= 224) return true
+  if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return true
+  if (parts[0] === 192 && parts[1] === 0 && parts[2] === 2) return true
+  if (parts[0] === 198 && parts[1] === 51 && parts[2] === 100) return true
+  if (parts[0] === 203 && parts[1] === 0 && parts[2] === 113) return true
+  return false
+}
+
 export function scrubPii(text: string, cfg: Config): string {
-  if (!text.includes('@')) return text
-  return text.replace(EMAIL, (m) => (allowedEmail(m, cfg) || cfg.allow.has(m) ? m : mint('EMAIL', m)))
+  let out = text
+  if (cfg.emails && out.includes('@')) {
+    out = out.replace(EMAIL, address => (allowedEmail(address, cfg) || cfg.allow.has(address) ? address : mint('EMAIL', address)))
+  }
+  out = out.replace(IPV4, address => {
+    if (cfg.allow.has(address) || (!cfg.privateIps && isPrivateV4(address))) return address
+    return mint('IP', address)
+  })
+  return out.replace(IPV6, address => {
+    if (cfg.allow.has(address)) return address
+    const lower = address.toLowerCase()
+    if (!cfg.privateIps && (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd'))) return address
+    return mint('IP', address)
+  })
 }
 
 // ------------------------------------------------------------- the walkers
@@ -1597,6 +1583,8 @@ export function makeConfig(options: Record<string, unknown>): Config {
   return {
     secrets: bool(options.secrets, true),
     pii: bool(options.pii, false),
+    emails: bool(options.hideEmails, true),
+    privateIps: bool(options.redactPrivateIps, false),
     restore: bool(options.restoreInToolInputs, true),
     restoreTools: new Set(strings(tools)),
     notify: bool(options.notify, true),
