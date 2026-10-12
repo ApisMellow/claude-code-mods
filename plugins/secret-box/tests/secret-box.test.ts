@@ -43,6 +43,24 @@ for (const [staged, isBlocked] of [['src/app.ts\n.env\n', true], ['src/app.ts\n'
   })
 }
 
+for (const options of [{}, { pii: false }, { pii: true }]) {
+  test(`email visibility follows pii ${JSON.stringify(options)} while secrets stay hidden`, { options }, async ($, on) => {
+    const address = 'dana.whitfield@northwind-labs.io'
+    const publicIp = '8.8.8.8'
+    stubs(on, { output: `contact ${address}, origin ${publicIp}, token ${STRIPE}` })
+    const result = String((await call($, { tool: 'Bash', command: 'cat output.txt' })).result)
+    expect(result).toContain(publicIp)
+    expect(result).not.toContain(STRIPE)
+    expect(result).toMatch(/\[REDACTED-SECRET-[0-9a-f]{8}\]/)
+    if (options.pii) {
+      expect(result).not.toContain(address)
+      expect(result).toMatch(/\[REDACTED-EMAIL-[0-9a-f]{8}\]/)
+    } else {
+      expect(result).toContain(address)
+    }
+  })
+}
+
 test('a key in any tool output comes back as a placeholder', async ($, on) => {
   stubs(on, { output: `charged with ${STRIPE}` })
   const r = await call($, { tool: 'Bash', command: 'node pay.js' })
