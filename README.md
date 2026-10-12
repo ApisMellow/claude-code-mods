@@ -53,8 +53,6 @@ claude plugin validate plugins/<mod>
 claude plugin test plugins/<mod>
 ```
 
-[AGENTS.md](AGENTS.md) has the rest: where the types come from, how tests run, and the rules for this repo.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).

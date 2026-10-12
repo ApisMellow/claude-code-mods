@@ -177,24 +177,19 @@ catches it, and `--debug-file` names it.
 
 ## Test it
 
-Step 1. Get the types. In Claude Code, from the root of this repo, run
-`/plugin-types`. It writes `types/claude-code.d.ts`, which is not in git.
-
-Step 2. Run the checks:
+Run the checks from the root of the repo:
 
 ```bash
 node --experimental-strip-types plugins/vercel-deploy-status/test/queue.test.mts
 claude plugin validate plugins/vercel-deploy-status
-npx tsc -p plugins/vercel-deploy-status/tsconfig.json
 ```
 
-Step 3. See it live. From a repo with a `.vercel/project.json`:
+See it live. From a repo with a `.vercel/project.json`:
 
 ```bash
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir /path/to/plugins/vercel-deploy-status
+claude --plugin-dir /path/to/plugins/vercel-deploy-status
 ```
 
 Then push a commit, or run `vercel deploy`, and watch the band. To see the
 loader's own view, add `--debug-file load.log` and look for the line
-`hooks module vercel-deploy-status loaded`. Debug output does not go to
-stderr under `-p`, so the file is the only place to read it.
+`hooks module vercel-deploy-status loaded`.
