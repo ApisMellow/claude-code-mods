@@ -1,102 +1,59 @@
-# awesome-claude-code-function-hooks
+# claude-code-mods
 
-Claude Code **function hooks** that are worth installing.
+Mods for Claude Code: panes, bands above the prompt, prompt guards, secret handling and memory tools. Each one is a plugin with a hooks module that runs inside the session, so it can see every event as it happens, change it, and draw in the terminal.
 
-**Not shell hooks.** Nothing here is a command in `settings.json` that Claude
-Code shells out to. A function hook is a TypeScript module that Claude Code
-loads and runs *inside* the session: no subprocess, no JSON on stdin, no exit
-code. It sees each event as it happens, it can change the event, and it can
-draw in the terminal.
-
-These are the **function hooks proposed in
-[anthropics/claude-code#91870](https://github.com/anthropics/claude-code/issues/91870)**.
-Read that issue first. It has the design, the videos and the architecture
-document, and it is where you say whether you want this to ship.
-
-## Turn the feature on first
-
-Function hooks are early access. They are **off by default**, and a plugin that
-uses one does nothing at all until you turn them on. Do this before you
-install anything here.
-
-Put it in your **user** settings, at `~/.claude/settings.json`, so every
-project gets it:
-
-```json
-{
-  "env": {
-    "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"
-  }
-}
-```
-
-Or set it for one run, to try it without changing a setting:
-
-```bash
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude
-```
-
-The API is early access, so it moves. A release can rename an event or change
-a payload. Pin what you rely on.
+Every mod installs on its own. Pick the ones you want.
 
 ## Install
 
-This repo is a plugin marketplace. Add it once, then install what you want.
+This repo is a plugin marketplace. Install any mod with one line:
 
 ```
-/plugin marketplace add ray-amjad/awesome-claude-code-function-hooks
-/plugin install secret-redactor@awesome-claude-code-function-hooks
-/plugin install vercel-deploy-status@awesome-claude-code-function-hooks
+/plugin install <mod> --marketplace ray-amjad/claude-code-mods
 ```
 
-## The function hooks
+Answer `y` to add the marketplace, then pick a scope. Or add the marketplace once and install from it:
 
-| Plugin | What it does |
+```
+/plugin marketplace add ray-amjad/claude-code-mods
+/plugin install cache-clock@claude-code-mods
+```
+
+## The mods
+
+| Mod | What it does |
 | --- | --- |
-| [secret-redactor](plugins/secret-redactor) | Swaps every secret, email address and IP address for a stable placeholder before the model reads it, then puts the real value back on the way into a tool call. Nothing goes to disk. |
-| [vercel-deploy-status](plugins/vercel-deploy-status) | Pins the Vercel deploy queue of the linked project under the prompt: one line per deploy that is queued, building or just finished, with its phase and elapsed time. A `git push` or a `gh pr merge` wakes it. |
+| [cache-clock](plugins/cache-clock) | A one-line band above the prompt: context used, and a countdown until the prompt cache goes cold. |
+| [decision-tree](plugins/decision-tree) | When Claude ends a reply with a question, explains the choice in a side pane and lets you explore any option, or your own, in a real forked session. |
+| [diagram-pane](plugins/diagram-pane) | A side pane that pins every diagram Claude draws and keeps a live map of the work. |
+| [dream-pass](plugins/dream-pass) | A dreaming pass over Claude's memory folder: merges duplicates, rewrites stale entries, removes dead ones and tidies MEMORY.md, with a backup and undo. |
+| [jev-skill-suggestion](plugins/jev-skill-suggestion) | Scores every skill against your prompt with TypeSafe Jev as you type. Observe, block or steer which skill loads. |
+| [memory-fork](plugins/memory-fork) | Keeps auto-memory up to date in the background: after each turn Haiku decides whether memory needs a change, and a tool-less fork of the session drafts it. |
+| [prompt-bouncer](plugins/prompt-bouncer) | Bounces vague prompts before Claude sees them, and suggests the project's own term. |
+| [secret-box](plugins/secret-box) | Claude uses a secret without seeing it: a masked box saves keys to `.env`, Claude gets a placeholder, and committing `.env` is refused. |
+| [transcript-redactor](plugins/transcript-redactor) | Keeps secrets out of the session transcript: each one becomes a stable placeholder, and the real value goes back in on the way into a tool call. |
+| [vercel-deploy-status](plugins/vercel-deploy-status) | Pins the Vercel deploy queue of the linked project under the prompt, with each deploy's phase and elapsed time. |
 
-## Work on this repo
+Each mod's README shows it running, explains how it works, and lists its options.
 
-The type declarations are **not in git**. Claude Code writes them, and every
-release rewrites them, so a checked-in copy goes stale and lies to you.
+secret-box already includes transcript-redactor. Run one or the other, not both.
 
-Make them yourself. In Claude Code, from the root of this repo, run:
+## Work on a mod
 
-```
-/plugin-types
-```
-
-That writes `types/claude-code.d.ts`. Every plugin's `tsconfig.json` points at
-it with `"include": ["../../types", "hooks"]`. Do this first, or `tsc`
-reports that `h`, `Box`, `Text` and the `claude-code` module do not exist.
-
-Never hand-edit `types/claude-code.d.ts`. Run `/plugin-types` again instead.
-
-Then check a plugin. Each one has the same three steps:
+Run a mod from its folder without installing it:
 
 ```bash
-node --experimental-strip-types plugins/secret-redactor/test/detect.test.mts
-claude plugin validate plugins/secret-redactor
-npx tsc -p plugins/secret-redactor/tsconfig.json
+claude --plugin-dir plugins/<mod>
 ```
 
-Run a plugin without installing it:
+Check it before you push:
 
 ```bash
-claude --plugin-dir plugins/secret-redactor
+claude plugin validate plugins/<mod>
+claude plugin test plugins/<mod>
 ```
 
-## Add a hook
-
-1. Make `plugins/<name>/` with `.claude-plugin/plugin.json` and
-   `hooks/hooks.json`.
-2. Point `hooks.json` at your module: `{ "modules": ["./your-hook.ts"] }`.
-3. Copy `plugins/secret-redactor/tsconfig.json`. It already points at
-   `../../types`.
-4. Add a `test/` that runs on plain `node --experimental-strip-types`, with no
-   dependencies.
-5. Add the plugin to `.claude-plugin/marketplace.json` and to the table above.
+[AGENTS.md](AGENTS.md) has the rest: where the types come from, how tests run, and the rules for this repo.
 
 ## License
 

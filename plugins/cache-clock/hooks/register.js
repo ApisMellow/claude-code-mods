@@ -1,0 +1,193 @@
+// cache-clock: one line above the prompt that shows how full the context is
+// and how long until the prompt cache goes cold.
+
+// Defaults, in minutes. Each can be changed with an environment variable.
+const DEFAULT_MAIN_TTL_MIN = 60 // main session cache (matches what the transcripts record)
+const DEFAULT_SUB_TTL_MIN = 5 // subagent cache
+const DEFAULT_WARN_MIN = 5 // toast (and auto handoff) when this much is left
+
+const MIN = 60_000
+
+// State shared by the hooks below
+const cfg = { mainTtl: DEFAULT_MAIN_TTL_MIN * MIN, subTtl: DEFAULT_SUB_TTL_MIN * MIN, warn: DEFAULT_WARN_MIN * MIN, sound: false, pinned: false, autoHandoff: true }
+let ttlSource = 'assumed' // 'measured' once we read it from the transcript
+let mainAt = 0 // when the main session last sent a request (ms)
+let subAt = 0 // when a subagent last sent one
+let warned = false // toast already shown for this warm period
+let wentCold = false // "went cold" already shown
+let working = false // a turn is running
+let handedOff = false // handoff written since the user last sent something
+let context = null // { tokens, window, percent } from $.session.usage()
+let transcript = null // path to this session's .jsonl
+
+// Read a number of minutes from an env var, or keep the default
+function minutes(value, fallback) {
+  const n = parseFloat(value ?? '')
+  return Number.isFinite(n) && n > 0 ? n * MIN : fallback
+}
+
+async function loadConfig($) {
+  const main = await $.env.get('CACHE_CLOCK_MAIN_TTL_MIN')
+  cfg.mainTtl = minutes(main, DEFAULT_MAIN_TTL_MIN * MIN)
+  cfg.pinned = main !== undefined // a value you set wins over the transcript
+  cfg.subTtl = minutes(await $.env.get('CACHE_CLOCK_SUB_TTL_MIN'), DEFAULT_SUB_TTL_MIN * MIN)
+  cfg.warn = minutes(await $.env.get('CACHE_CLOCK_WARN_MIN'), DEFAULT_WARN_MIN * MIN)
+  cfg.sound = (await $.env.get('CACHE_CLOCK_SOUND')) === '1'
+  cfg.autoHandoff = (await $.env.get('CACHE_CLOCK_AUTO_HANDOFF')) !== '0'
+}
+
+// The real TTL: each assistant row in the transcript says which cache bucket
+// it wrote to (ephemeral_1h or ephemeral_5m). Read the newest main-thread one.
+async function readTtl($) {
+  if (!transcript || cfg.pinned) return
+  const { stdout } = await $.process.run(['tail', '-n', '300', transcript])
+  const rows = stdout.split('\n').reverse()
+  for (const row of rows) {
+    if (!row.includes('"cache_creation"')) continue
+    let msg
+    try { msg = JSON.parse(row) } catch { continue }
+    if (msg.type !== 'assistant' || msg.isSidechain) continue
+    const cc = msg.message?.usage?.cache_creation ?? {}
+    if (cc.ephemeral_1h_input_tokens > 0) { cfg.mainTtl = 60 * MIN; ttlSource = 'measured'; return }
+    if (cc.ephemeral_5m_input_tokens > 0) { cfg.mainTtl = 5 * MIN; ttlSource = 'measured'; return }
+    // a pure cache read does not say which bucket; look further back
+  }
+}
+
+// 47:05 or 3:09
+function clock(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000))
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')
+}
+
+function fmtTokens(n) {
+  if (n >= 1_000_000) return +(n / 1_000_000).toFixed(1) + 'M'
+  return n >= 1000 ? Math.round(n / 1000) + 'k' : String(n)
+}
+
+// Everything the band shows, as plain pieces so /cache-clock can print it too
+function snapshot(now) {
+  const left = mainAt ? mainAt + cfg.mainTtl - now : 0
+  const subLeft = subAt ? subAt + cfg.subTtl - now : 0
+  // Colour: green, then yellow in the last quarter, red inside the warning window
+  let color = 'green'
+  if (!mainAt || left <= 0) color = 'gray'
+  else if (left <= cfg.warn) color = 'red'
+  else if (left <= cfg.mainTtl / 4) color = 'yellow'
+  const ttl = (cfg.mainTtl >= 60 * MIN ? cfg.mainTtl / (60 * MIN) + 'h' : cfg.mainTtl / MIN + 'm') + ' ttl ' + (cfg.pinned ? 'set' : ttlSource)
+  const cache = !mainAt ? 'cache: no request yet' : left > 0 ? 'cache ' + clock(left) + ' left' : 'cache cold'
+  let ctx = 'ctx --'
+  if (context?.tokens) {
+    const pct = context.percent ?? Math.round((context.tokens / context.window) * 100)
+    const filled = Math.round(pct / 10)
+    ctx = 'ctx ' + fmtTokens(context.tokens) + '/' + fmtTokens(context.window) + ' ' + pct + '% ' + '▰'.repeat(filled) + '▱'.repeat(10 - filled)
+  }
+  const sub = subLeft > 0 ? 'sub ' + clock(subLeft) : null
+  return { color, cache, ttl, ctx, sub, left }
+}
+
+function asText(s) {
+  return [s.cache + ' (' + s.ttl + ')', s.ctx, s.sub].filter(Boolean).join('  |  ')
+}
+
+// The handoff prompt. The marker lets prompt.submit tell it from the user's own prompts.
+const HANDOFF_MARKER = 'cache-clock handoff'
+function handoffText(file) {
+  return '(' + HANDOFF_MARKER + ') The prompt cache goes cold soon and the user has not replied. While the cache is still warm, write a short handoff note to ' + file + ': the goal, what is done, what is next, open questions, and the key files. Keep it brief, and write it even if the session has been short. Do nothing else. A fresh session will start from it if the user does not come back.'
+}
+
+// Once a second: warn near expiry, note when it goes cold, redraw the band
+async function tick($) {
+  const s = snapshot(await $.clock.now())
+  if (mainAt && s.left > 0 && s.left <= cfg.warn && !warned) {
+    warned = true
+    // Idle and nothing handed off since the user's last message: write the handoff on the warm cache
+    if (cfg.autoHandoff && !working && !handedOff) {
+      handedOff = true
+      const file = (await $.session.cwd()) + '/HANDOFF.md'
+      $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. No reply, so Claude is writing HANDOFF.md while it is warm.', { timeoutMs: 10_000 })
+      $.prompt.submit({ text: handoffText(file) }).catch(() => {}) // waits for idle; don't await in the tick
+    } else {
+      $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. Send something to keep it warm.', { timeoutMs: 10_000 })
+    }
+    if (cfg.sound) $.audio.play({ asset: 'sounds/cooling.wav' }).catch(() => {})
+  }
+  if (mainAt && s.left <= 0 && !wentCold) {
+    wentCold = true
+    $.ui.toast('Prompt cache is cold. The next message re-sends the whole context at full price.')
+  }
+  $.ui.invalidate('ui.render')
+}
+
+export function register(on) {
+  on('session.start', async ($, e, next) => {
+    await loadConfig($)
+    context = (await $.session.usage()).context
+    await $.command.register({ name: 'cache-clock', description: 'Print the cache countdown and context use' })
+    $.clock.every(1000, () => tick($))
+    return next(e)
+  })
+
+  // On a resume, the session tells us how long ago the last answer was,
+  // so the clock picks up where it left off
+  on('classic.SessionStart', async ($, e, next) => {
+    transcript = e.transcript_path ?? transcript
+    if (e.seconds_since_last_response != null) mainAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
+    await readTtl($)
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e))) // never block the session on our error
+
+  // Track whether a turn is running, so the auto handoff never queues behind one
+  on('turn.start', async ($, e, next) => { working = true; return next(e) })
+  on('turn.complete', async ($, e, next) => { working = false; return next(e) })
+
+  // A prompt from the user (not our own handoff) re-arms the auto handoff
+  on('prompt.submit', async ($, e, next) => {
+    if (!String(e.text ?? '').includes(HANDOFF_MARKER)) handedOff = false
+    return next(e)
+  })
+
+  // Every request to the model refreshes its cache: restart the right clock
+  on('turn.step', async function* ($, e, next) {
+    const now = await $.clock.now()
+    if (e.agentId) subAt = now
+    else { mainAt = now; warned = false; wentCold = false }
+    yield* next(e)
+  })
+
+  // After each turn, check which TTL the API actually used
+  on('classic.Stop', async ($, e, next) => {
+    transcript = e.transcript_path ?? transcript
+    await readTtl($)
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  // Context figures, pushed after each turn
+  on('session.measure', async ($, e, next) => {
+    context = e.context
+    return next(e)
+  })
+
+  // The band itself: one line above the prompt
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const s = snapshot(await $.clock.now())
+    // Pieces in order of importance; drop from the end until it fits one line
+    const pieces = [
+      { text: '◷ ' + s.cache, style: { color: s.color, bold: s.color === 'red' } },
+      { text: s.ctx, style: {} },
+      s.sub && { text: s.sub, style: { dimColor: true } },
+      { text: s.ttl, style: { dimColor: true } },
+    ].filter(Boolean)
+    const SEP = '  ·  '
+    while (pieces.length > 1 && pieces.map((p) => p.text).join(SEP).length > e.props.bodyColumns) pieces.pop()
+    const parts = pieces.flatMap((p, i) => i ? [h(Text, { dimColor: true }, SEP), h(Text, p.style, p.text)] : [h(Text, p.style, p.text)])
+    return h(Box, {}, h(Text, { wrap: 'truncate-end' }, ...parts))
+  })
+
+  on('command.run', { command: 'cache-clock' }, async ($) => {
+    await readTtl($)
+    return { text: asText(snapshot(await $.clock.now())) }
+  })
+}
