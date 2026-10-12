@@ -1,6 +1,7 @@
 # The secret detector cannot be tested without secret-shaped values.
 #
-# Every credential-looking string under a plugin's test/ directory is
+# Every credential-looking string under a plugin's test/ or tests/ directory,
+# and in the example comments of a detector (hooks/detect.ts), is
 # synthetic. Each one was checked against every credential file on the
 # author's machine and matched nothing. They exist so the HIDE list in
 # detect.test.mts proves the detector still catches each vendor shape.
@@ -18,5 +19,6 @@ regex = '''$^'''
 [allowlist]
 description = "synthetic fixtures for the detector's own test suite"
 paths = [
-  '''plugins/[^/]+/test/.*''',
+  '''plugins/[^/]+/tests?/.*''',
+  '''plugins/[^/]+/hooks/detect\.ts''',
 ]
