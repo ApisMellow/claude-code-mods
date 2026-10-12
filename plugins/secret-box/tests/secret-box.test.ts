@@ -43,16 +43,21 @@ for (const [staged, isBlocked] of [['src/app.ts\n.env\n', true], ['src/app.ts\n'
   })
 }
 
-for (const options of [{}, { pii: false }, { pii: true }]) {
+for (const options of [{}, { pii: false }, { pii: true }, { pii: true, hideEmails: false }]) {
   test(`email visibility follows pii ${JSON.stringify(options)} while secrets stay hidden`, { options }, async ($, on) => {
     const address = 'dana.whitfield@northwind-labs.io'
     const publicIp = '8.8.8.8'
     stubs(on, { output: `contact ${address}, origin ${publicIp}, token ${STRIPE}` })
     const result = String((await call($, { tool: 'Bash', command: 'cat output.txt' })).result)
-    expect(result).toContain(publicIp)
+    if (options.pii) {
+      expect(result).not.toContain(publicIp)
+      expect(result).toMatch(/\[REDACTED-IP-[0-9a-f]{8}\]/)
+    } else {
+      expect(result).toContain(publicIp)
+    }
     expect(result).not.toContain(STRIPE)
     expect(result).toMatch(/\[REDACTED-SECRET-[0-9a-f]{8}\]/)
-    if (options.pii) {
+    if (options.pii && options.hideEmails !== false) {
       expect(result).not.toContain(address)
       expect(result).toMatch(/\[REDACTED-EMAIL-[0-9a-f]{8}\]/)
     } else {

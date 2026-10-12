@@ -61,7 +61,7 @@ And kept, because hiding it would only add noise:
 - **Alphabets.** A long token that uses every character once is a charset constant.
 - **Bare hex.** A 40-character hex run is a git SHA far more often than a key, so it only counts when a key name sits in front of it.
 
-With `pii` on, email addresses are hidden too, except `noreply@`, documentation domains like `@example.com`, and anything in `allowEmails`.
+With `pii` on, public IPv4 addresses and full-form IPv6 addresses are hidden. Email addresses are hidden too unless `hideEmails` is `false`, except `noreply@`, documentation domains like `@example.com`, and anything in `allowEmails`.
 
 ## Settings
 
@@ -70,7 +70,9 @@ Set them with `/plugin configure transcript-redactor@claude-code-mods`, or under
 | Option | Default | What it does |
 | :- | :- | :- |
 | `secrets` | `true` | Hide secrets |
-| `pii` | `false` | Also hide email addresses |
+| `pii` | `false` | Hide email addresses and public IP addresses |
+| `hideEmails` | `true` | With `pii` on, also hide emails; turn off to hide only IPs |
+| `redactPrivateIps` | `false` | With `pii` on, also hide private and reserved IPs recognized by the detector |
 | `restoreInToolInputs` | `true` | Turn placeholders back into real values before a tool runs |
 | `restoreTools` | `Bash,Write,Edit,MultiEdit,NotebookEdit` | The tools that may receive a real value. Tools that send data off the machine (`WebFetch`, MCP tools) are left out on purpose |
 | `notify` | `true` | A count on the tool row, a toast on a prompt |
@@ -95,7 +97,7 @@ Six hooks, one vault.
 | `prompt.mention` | Refuses an `@` file that holds a key, because its raw text is stored before any hook sees it, and tells Claude to `Read` it instead |
 | `agent.spawn` | Swaps keys out of a subagent's task |
 
-- **The vault** maps each value to a placeholder made with a keyed hash. The key is picked at random each session, so a placeholder can't be worked back to its value or matched across sessions.
+- **The vault** maps each value to a random placeholder, reused only within the session. Tags use `crypto.getRandomValues` when available, with `Math.random` as the fallback, so a placeholder can't be worked back to its value or matched across sessions.
 - **Placeholders already in a file.** If a file Claude reads holds text shaped like a placeholder, it comes back as a `[REDACTED-LITERAL-…]` placeholder that restores to that text, so a crafted file can't trick the mod into writing a real key somewhere.
 - **Fail closed.** Every hook has a `.catch`. If a scan breaks, or would run past the hook's 10 second budget, the result is withheld, the prompt isn't sent or the subagent isn't started. Nothing goes through unscanned.
 - **Restored values stay hidden.** A value the mod restores into a command is hidden again if that command prints it, even a short one the detector would miss.
@@ -124,8 +126,17 @@ claude --plugin-dir ./transcript-redactor
 claude plugin validate .
 claude plugin test .
 node --experimental-strip-types test/detect.test.mts
+node --experimental-strip-types test/session-privacy.test.mts
+node --experimental-strip-types test/random-tags.test.mts
+node --experimental-strip-types test/pii-options.test.mts
 ```
 
 `test/detect.test.mts` holds two lists, 174 values that must be hidden and 114 that must be kept, and times the scan on large inputs. A change to a pattern or a threshold is only done when both lists still pass. `tests/redact.test.ts` covers the hooks: restore, scrub and fail closed.
 
 Tested with Claude Code 2.1.296.
+
+## Original redactor contributions
+
+Random placeholder tags were contributed by [Ben Ellis (@benissimo)](https://github.com/ray-amjad/claude-code-mods/pull/1). The `hideEmails` option was contributed by [Cody Harris (@VibeCodyH)](https://github.com/ray-amjad/claude-code-mods/pull/2). Both implementations are adapted to this mod's current vault and hooks.
+
+To keep emails readable while hiding public IPs, set `pii: true` and `hideEmails: false`. PII hiding remains off by default. The restored IP detector recognizes IPv4 and full-form IPv6; compressed IPv6 is not comprehensively covered.
