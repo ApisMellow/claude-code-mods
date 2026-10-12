@@ -1,4 +1,4 @@
-export type Change = { name: string; kind: 'added' | 'updated' | 'deleted' }
+export type Change = { name: string; kind: 'added' | 'updated' | 'deleted'; added: number; removed: number }
 
 export type Run = {
   id: string

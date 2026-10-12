@@ -2,7 +2,7 @@
 
 A Claude Code mod that keeps your auto-memory up to date in the background, so the main session never stops to write it.
 
-![memory-fork in a session: two "remember" turns, the Memory bar above the prompt listing the files changed with Open and Hide buttons, the Memory pane showing each run's added, updated and deleted files, and the four steps from turn end to files on disk](diagram.png)
+![memory-fork in a session: two "remember" turns, the Memory bar above the prompt with the lines added and removed and the files changed, with Open and Hide buttons, the Memory pane showing each run's added, updated and deleted files with their line counts, and the four steps from turn end to files on disk](diagram.png)
 
 After every turn:
 
@@ -10,7 +10,7 @@ After every turn:
 2. **A fork drafts the change.** `$.model.fork` replays the session's own transcript (served from the prompt cache) with the current memory files attached. Every tool is denied; it can only reply with JSON: `{"write": [{"name", "content"}], "delete": [...]}`.
 3. **The mod writes it.** The files are written with `$.fs.write` and deletions run as `rm -f`, only for bare `*.md` names inside the project's memory folder. `MEMORY.md` is never deleted.
 
-A band above the prompt shows the run (`Memory: updating …`, then the files changed) with **Open** and **Hide** buttons. **Open** shows a pane listing every run this session. `/memory-fork` opens the same pane.
+A band above the prompt shows the run (`Memory: updating …`, then the lines added and removed and the files changed, as in `Memory: +13 −13 · db-p99-under-10ms.md, MEMORY.md`) with **Open** and **Hide** buttons. **Open** shows a pane listing every run this session, each file with its own `+added −removed` count, and the session total at the top. `/memory-fork` opens the same pane.
 
 The main session is told that memory is handled, and its own `Write`/`Edit` calls into the memory folder are refused.
 

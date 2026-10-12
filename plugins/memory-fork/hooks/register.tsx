@@ -64,17 +64,40 @@ const readMemory = async ($: EngineInterface, dir: string) =>
     ),
   )
 
+// File name to content. Memory files are small, so the whole folder is read before and after the fork.
 type Snapshot = Map<string, string>
 
-const snapshot = async ($: EngineInterface, dir: string): Promise<Snapshot> =>
-  new Map((await memoryFiles($, dir)).map(one => [one.name, `${one.mtimeMs}:${one.size}`]))
+const toLines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
+
+// Lines added and removed between two texts, counted from their longest common subsequence.
+export const lineDiff = (before: string, after: string) => {
+  const a = toLines(before)
+  const b = toLines(after)
+  let row = new Array<number>(b.length + 1).fill(0)
+  for (const line of a) {
+    const next = [0]
+    for (let j = 0; j < b.length; j++) next.push(line === b[j] ? (row[j] ?? 0) + 1 : Math.max(row[j + 1] ?? 0, next[j] ?? 0))
+    row = next
+  }
+  const kept = row[b.length] ?? 0
+
+  return { added: b.length - kept, removed: a.length - kept }
+}
 
 export const diff = (before: Snapshot, after: Snapshot): Change[] => [
-  ...[...after].flatMap(([name, stamp]): Change[] =>
-    !before.has(name) ? [{ name, kind: 'added' }] : before.get(name) !== stamp ? [{ name, kind: 'updated' }] : [],
-  ),
-  ...[...before.keys()].filter(name => !after.has(name)).map((name): Change => ({ name, kind: 'deleted' })),
+  ...[...after].flatMap(([name, text]): Change[] => {
+    const old = before.get(name)
+    if (old === text) return []
+
+    return [{ name, kind: old === undefined ? 'added' : 'updated', ...lineDiff(old ?? '', text) }]
+  }),
+  ...[...before]
+    .filter(([name]) => !after.has(name))
+    .map(([name, text]): Change => ({ name, kind: 'deleted', ...lineDiff(text, '') })),
 ]
+
+export const totals = (changes: Change[]) =>
+  changes.reduce((sum, one) => ({ added: sum.added + one.added, removed: sum.removed + one.removed }), { added: 0, removed: 0 })
 
 export const lastExchange = (messages: SessionMessage[]) => {
   const start = messages.findLastIndex(m => m.role === 'user' && m.text.trim() !== '' && !m.toolResults?.length)
@@ -131,8 +154,8 @@ async function write($: EngineInterface) {
 
   const reason = line.replace(/^UPDATE:?\s*/, '')
   await setRun($, id, { status: 'forking', reason })
-  const before = await snapshot($, dir)
-  const reply = await $.model.fork({ prompt: writerPrompt(reason, await readMemory($, dir)) })
+  const before = await readMemory($, dir)
+  const reply = await $.model.fork({ prompt: writerPrompt(reason, before) })
   if (!reply.isAnswered) return setRun($, id, { status: 'failed', reason: `fork: ${reply.reason}` })
 
   let ops: ReturnType<typeof parseOps>
@@ -144,7 +167,7 @@ async function write($: EngineInterface) {
   for (const one of ops.write) await $.fs.write(`${dir}/${one.name}`, one.content)
   if (ops.delete.length > 0) await $.process.run(['rm', '-f', ...ops.delete.map(name => `${dir}/${name}`)])
 
-  await setRun($, id, { status: 'done', changes: diff(before, await snapshot($, dir)) })
+  await setRun($, id, { status: 'done', changes: diff(before, await readMemory($, dir)) })
 }
 
 export const register: Register = on => {
@@ -199,12 +222,16 @@ export const register: Register = on => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const files = latest.changes.map(change => change.name).join(', ')
+    const sum = totals(latest.changes)
 
     return (
       <Box>
-        <Text color={latest.status === 'failed' ? 'red' : undefined} dimColor={latest.status === 'done'}>
+        <Text color={latest.status === 'failed' ? 'red' : undefined}>
           {latest.status === 'forking' && `Memory: updating (${latest.reason}) `}
-          {latest.status === 'done' && `Memory: ${files || 'no change'} `}
+          {latest.status === 'done' && 'Memory: '}
+          {latest.status === 'done' && latest.changes.length > 0 && <Text color="green">+{sum.added} </Text>}
+          {latest.status === 'done' && latest.changes.length > 0 && <Text color="red">−{sum.removed} </Text>}
+          {latest.status === 'done' && <Text dimColor>{files ? `· ${files} ` : 'no change '}</Text>}
           {latest.status === 'failed' && `Memory: failed (${latest.reason}) `}
         </Text>
         <Button key="open" label="Open" onPress={() => $.ui.open({ id: PANE, title: 'Memory' })} />
@@ -218,6 +245,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const list = await read($, runs)
     const touched = new Set(list.flatMap(run => run.changes.filter(c => c.name !== 'MEMORY.md').map(c => c.name)))
+    const session = totals(list.flatMap(run => run.changes))
     const room = Math.max(1, (e.viewport?.rows ?? 24) - 6)
     const time = (at: number) => new Date(at).toTimeString().slice(0, 5)
     const mark = { added: '+', updated: '~', deleted: '-' } as const
@@ -225,9 +253,14 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Text bold>
-          {touched.size} {touched.size === 1 ? 'memory' : 'memories'} changed this session
-        </Text>
+        <Box>
+          <Text bold>
+            {touched.size} {touched.size === 1 ? 'memory' : 'memories'} changed this session{'  '}
+          </Text>
+          <Text color="green">+{session.added}</Text>
+          <Text> </Text>
+          <Text color="red">−{session.removed}</Text>
+        </Box>
         {list.length === 0 && <Text dimColor>Waiting for the first turn to end.</Text>}
         {[...list]
           .reverse()
@@ -245,10 +278,15 @@ export const register: Register = on => {
                 {run.status === 'failed' && `failed: ${run.reason}`}
               </Text>
               {run.changes.map(change => (
-                <Text color={colour[change.kind]}>
-                  {'  '}
-                  {mark[change.kind]} {change.name}
-                </Text>
+                <Box>
+                  <Text color={colour[change.kind]}>
+                    {'  '}
+                    {mark[change.kind]} {change.name}{'  '}
+                  </Text>
+                  <Text color="green">+{change.added}</Text>
+                  <Text> </Text>
+                  <Text color="red">−{change.removed}</Text>
+                </Box>
               ))}
             </Box>
           ))}

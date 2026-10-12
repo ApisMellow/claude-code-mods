@@ -1,16 +1,23 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { diff, lastExchange, parseOps } from '../hooks/register'
+import { diff, lastExchange, lineDiff, parseOps, totals } from '../hooks/register'
 
-test('diff names added, updated and deleted memories', async () => {
-  const before = new Map([['a.md', '1:10'], ['b.md', '1:10'], ['c.md', '1:10']])
-  const after = new Map([['a.md', '1:10'], ['b.md', '2:12'], ['d.md', '3:5']])
+test('diff names added, updated and deleted memories with their line counts', async () => {
+  const before = new Map([['a.md', 'one\ntwo\n'], ['b.md', 'one\ntwo\nthree\n'], ['c.md', 'gone\nalso gone\n']])
+  const after = new Map([['a.md', 'one\ntwo\n'], ['b.md', 'one\n2\nthree\nfour\n'], ['d.md', 'new\n']])
 
   expect(diff(before, after)).toEqual([
-    { name: 'b.md', kind: 'updated' },
-    { name: 'd.md', kind: 'added' },
-    { name: 'c.md', kind: 'deleted' },
+    { name: 'b.md', kind: 'updated', added: 2, removed: 1 },
+    { name: 'd.md', kind: 'added', added: 1, removed: 0 },
+    { name: 'c.md', kind: 'deleted', added: 0, removed: 2 },
   ])
+  expect(totals(diff(before, after))).toEqual({ added: 3, removed: 3 })
+})
+
+test('lineDiff counts a moved line as one removed and one added', async () => {
+  expect(lineDiff('a\nb\nc', 'b\nc\na')).toEqual({ added: 1, removed: 1 })
+  expect(lineDiff('', '')).toEqual({ added: 0, removed: 0 })
+  expect(lineDiff('same\n', 'same')).toEqual({ added: 0, removed: 0 })
 })
 
 test('lastExchange starts at the latest typed prompt', async () => {
