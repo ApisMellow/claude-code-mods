@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { pickAction } from '../hooks/register'
+import { handoffPath, pickAction } from '../hooks/register'
 
 test('the band draws one line', async ($, on) => {
   on('clock.now', () => ({ value: 1_000_000 }))
@@ -15,4 +15,9 @@ test('the warning action comes from the env var, then the old switch, then the s
   expect(pickAction(undefined, '0', 'compact')).toBe('off')
   expect(pickAction('compact', '0', 'off')).toBe('compact')
   expect(pickAction('nonsense', undefined, undefined)).toBe('handoff')
+})
+
+test('each session gets its own handoff note', async () => {
+  expect(handoffPath('/w/proj', '1a2b3c4d-5e6f-7a8b-9c0d-ef0123456789')).toBe('/w/proj/HANDOFF-1a2b3c4d.md')
+  expect(handoffPath('/w/notes/', '9f8e7d6c-0000')).toBe('/w/notes/HANDOFF-9f8e7d6c.md')
 })

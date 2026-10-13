@@ -9,7 +9,7 @@ const DEFAULT_WARN_MIN = 5 // toast (and the onWarning action) when this much is
 const MIN = 60_000
 
 // State shared by the hooks below
-const cfg = { mainTtl: DEFAULT_MAIN_TTL_MIN * MIN, subTtl: DEFAULT_SUB_TTL_MIN * MIN, warn: DEFAULT_WARN_MIN * MIN, sound: false, pinned: false, onWarning: 'handoff' }
+const cfg = { mainTtl: DEFAULT_MAIN_TTL_MIN * MIN, subTtl: DEFAULT_SUB_TTL_MIN * MIN, warn: DEFAULT_WARN_MIN * MIN, sound: false, pinned: false, onWarning: 'handoff', handoffDir: '' }
 let ttlSource = 'assumed' // 'measured' once we read it from the transcript
 let mainAt = 0 // when the main session last sent a request (ms)
 let subAt = 0 // when a subagent last sent one
@@ -42,6 +42,7 @@ async function loadConfig($, options) {
   cfg.subTtl = minutes(await $.env.get('CACHE_CLOCK_SUB_TTL_MIN'), DEFAULT_SUB_TTL_MIN * MIN)
   cfg.warn = minutes(await $.env.get('CACHE_CLOCK_WARN_MIN'), DEFAULT_WARN_MIN * MIN)
   cfg.sound = (await $.env.get('CACHE_CLOCK_SOUND')) === '1'
+  cfg.handoffDir = (await $.env.get('CACHE_CLOCK_HANDOFF_DIR')) ?? ''
   // The plugin setting, unless an env var overrides it. CACHE_CLOCK_AUTO_HANDOFF=0 still means off.
   cfg.onWarning = pickAction(await $.env.get('CACHE_CLOCK_ON_WARNING'), await $.env.get('CACHE_CLOCK_AUTO_HANDOFF'), options?.onWarning)
 }
@@ -102,6 +103,13 @@ function asText(s) {
 
 // The handoff prompt. The marker lets prompt.submit tell it from the user's own prompts.
 const HANDOFF_MARKER = 'cache-clock handoff'
+
+// One note per session, so parallel sessions in one folder never overwrite
+// each other's. It goes to CACHE_CLOCK_HANDOFF_DIR, else the project root
+// (not the shell's current folder, which a `cd` can move into a nested repo).
+export function handoffPath(dir, sessionId) {
+  return dir.replace(/\/+$/, '') + '/HANDOFF-' + String(sessionId).slice(0, 8) + '.md'
+}
 function handoffText(file) {
   return '(' + HANDOFF_MARKER + ') The prompt cache goes cold soon and the user has not replied. While the cache is still warm, write a short handoff note to ' + file + ': the goal, what is done, what is next, open questions, and the key files. Keep it brief, and write it even if the session has been short. Do nothing else. A fresh session will start from it if the user does not come back.'
 }
@@ -133,8 +141,8 @@ async function tick($) {
       handedOff = true
       if (cfg.onWarning === 'compact') compactWarm($, s.left)
       else {
-        const file = (await $.session.cwd()) + '/HANDOFF.md'
-        $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. No reply, so Claude is writing HANDOFF.md while it is warm.', { timeoutMs: 10_000 })
+        const file = handoffPath(cfg.handoffDir || (await $.session.root()), await $.session.id())
+        $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. No reply, so Claude is writing ' + file.split('/').pop() + ' while it is warm.', { timeoutMs: 10_000 })
         $.prompt.submit({ text: handoffText(file) }).catch(() => {}) // waits for idle; don't await in the tick
       }
     } else {
