@@ -128,7 +128,7 @@ test('/jev off leaves skills to Claude and adds nothing; /jev on brings it back'
   expect(context).toEqual([])
   expect((await $.tool.call({ tool: 'Skill', skill: 'linkedin' })).deny).toBe(undefined)
   await $.command.run({ command: 'jev', args: 'on' } as never)
-  expect((await $.tool.call({ tool: 'Skill', skill: 'linkedin' })).deny).toMatch(/only the skill Jev picked/)
+  expect((await $.tool.call({ tool: 'Skill', skill: 'linkedin' })).deny).toMatch(/only the skill picked/)
 })
 
 test('/jev off is kept across sessions', async ($, on) => {
@@ -137,7 +137,7 @@ test('/jev off is kept across sessions', async ($, on) => {
   expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toBe(undefined)
 })
 
-test('pick mode: the skill chosen in the band rides along, and only it may load', async ($, on) => {
+test('steer: choosing another skill in the band overrides Jev for that prompt', async ($, on) => {
   let context: readonly string[] = []
   on('prompt.submit', (_$, e) => {
     context = e.context ?? []
@@ -149,21 +149,38 @@ test('pick mode: the skill chosen in the band rides along, and only it may load'
   on('ui.invalidate', () => ({ value: undefined }) as never)
   await start($, on, { mode: 'steer' })
   await $.prompt.submit({ text: 'split the pane and run the tests' } as never) // scores: herdr, then linkedin
-  await $.command.run({ command: 'jev', args: 'pick' } as never)
 
   const ui = await $.ui.mount({ plugin: 'jev-skill-suggestion', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS } as never)
   expect(await ui.find({ type: 'Text', text: /other band/ } as never)).toBeDefined()
+  expect(await ui.find({ key: 'choose:linkedin' } as never)).toBeDefined()
   await ui.press({ key: 'choose:linkedin' } as never)
   await $.prompt.submit({ text: 'write it up as a post' } as never)
   expect(context.join('')).toMatch(/The user chose the skill linkedin/)
   expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toMatch(/linkedin/)
   expect((await $.tool.call({ tool: 'Skill', skill: 'linkedin' })).deny).toBe(undefined)
+
+  // The override was for that prompt only: the next one follows Jev again
+  await $.prompt.submit({ text: 'split the pane and run the tests' } as never)
+  expect(context.join('')).toMatch(/Relevant to the current request: herdr/)
 })
 
-test('pick mode with nothing chosen loads no skill', async ($, on) => {
+test('steer: choosing none loads no skill', async ($, on) => {
+  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
+  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }) as never)
+  on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', children: [''] }) as never)
+  on('ui.invalidate', () => ({ value: undefined }) as never)
+  await start($, on, { mode: 'steer' })
+  await $.prompt.submit({ text: 'split the pane and run the tests' } as never)
+  const ui = await $.ui.mount({ plugin: 'jev-skill-suggestion', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS } as never)
+  await ui.press({ key: 'choose:none' } as never)
+  await $.prompt.submit({ text: 'split the pane and run the tests' } as never)
+  expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toMatch(/\(none\)/)
+})
+
+test('the old pick mode is read as steer', async ($, on) => {
   on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
   on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }) as never)
   await start($, on, { mode: 'pick' })
   await $.prompt.submit({ text: 'split the pane and run the tests' } as never)
-  expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toMatch(/\(none\)/)
+  expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toBe(undefined)
 })
