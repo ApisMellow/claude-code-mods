@@ -15,7 +15,7 @@ const FITS_THRESHOLD = 0.3
 const DEBOUNCE_MS = 600
 const MIN_CHARS = 8
 const PANE = 'jev-skill-suggestion'
-const MODES: Mode[] = ['observe', 'block', 'steer', 'pick']
+const MODES: Mode[] = ['observe', 'block', 'steer']
 
 const GATE_QUESTIONS: Record<string, string> = {
   acts_on_user_system:
@@ -33,8 +33,6 @@ const roster = atom({ plugin: 'jev-skill-suggestion', key: 'roster' } as const, 
 const verdict = atom({ plugin: 'jev-skill-suggestion', key: 'verdict' } as const, null)
 const status = atom({ plugin: 'jev-skill-suggestion', key: 'status' } as const, '')
 const enabled = atom({ plugin: 'jev-skill-suggestion', key: 'enabled' } as const, true)
-// pick mode: the skill the person chose for the prompt they are writing
-const chosen = atom({ plugin: 'jev-skill-suggestion', key: 'chosen' } as const, null)
 
 const unquote = (value: string) => value.trim().replace(/^(['"])([\s\S]*)\1$/, '$2')
 
@@ -98,9 +96,7 @@ const runtime: {
   disk: Skill[]
   listed: Skill[]
   timer?: { cancel: () => void }
-  // pick mode: the skill chosen for the prompt just sent, the one that may load
-  sent: string | null
-} = { apiKey: '', asked: 0, disk: [], listed: [], sent: null }
+} = { apiKey: '', asked: 0, disk: [], listed: [] }
 
 async function ask($: Engine, state: unknown, questions: Record<string, unknown>) {
   const response = await $.http.fetch(API, {
@@ -230,11 +226,6 @@ const setEnabled = async ($: Engine, on: boolean) => {
   $.ui.invalidate('prompt.attachment')
 }
 
-// pick mode: choose a skill for the next prompt, or press it again to clear
-const choose = async ($: Engine, name: string | null) => {
-  await update($, chosen, current => (current === name ? null : name))
-}
-
 const toggle = async ($: Engine, name: string) => {
   const list = await update($, disabled, list =>
     list.includes(name) ? list.filter(one => one !== name) : [...list, name],
@@ -260,7 +251,7 @@ export const register: Register = (on, options) => {
     await update($, roster, () => mergeRoster(runtime.disk, runtime.listed))
     await $.command.register({
       name: 'jev',
-      description: 'Jev skill scores: open the skills pane, `/jev observe|block|steer|pick`, or `/jev off|on`',
+      description: 'Jev skill scores: open the skills pane, `/jev observe|block|steer`, or `/jev off|on`',
     })
     return next(e)
   })
@@ -296,20 +287,10 @@ export const register: Register = (on, options) => {
   })
 
   // Steer: the winner rides along as a hidden context block on the prompt.
-  // Pick: the skill the person chose rides along instead.
   on('prompt.submit', async ($, e, next) => {
     runtime.timer?.cancel()
     const text = e.text.trim()
     if (!(await read($, enabled)) || text.startsWith('/')) return next(e)
-    if ((await read($, mode)) === 'pick') {
-      runtime.sent = await read($, chosen)
-      await update($, chosen, () => null)
-      if (!runtime.sent) return next(e)
-      const note =
-        `<skill_relevance>\nThe user chose the skill ${runtime.sent} for this request. ` +
-        'Load it with the Skill tool before you start.\n</skill_relevance>'
-      return next({ ...e, context: [...(e.context ?? []), note] })
-    }
     if ((await read($, mode)) !== 'steer' || text.length < MIN_CHARS) return next(e)
     const known = await read($, verdict)
     const result = known?.text === text ? known : await score($, text)
@@ -352,9 +333,6 @@ export const register: Register = (on, options) => {
     if (current === 'block') {
       return { deny: 'jev-skill-suggestion: skill loading is blocked in this session. Carry on without a skill.' }
     }
-    if (current === 'pick' && runtime.sent !== name) {
-      return { deny: `jev-skill-suggestion: only the skill the user chose may load${runtime.sent ? ` (${runtime.sent})` : ' (none)'}.` }
-    }
     if (current === 'steer') {
       const pick = (await read($, verdict))?.winner
       if (pick !== name) {
@@ -370,8 +348,7 @@ export const register: Register = (on, options) => {
     const result = await read($, verdict)
     const note = await read($, status)
     const current = await read($, mode)
-    const pick = await read($, chosen)
-    if (e.props.hasSurvey || (result === null && note === '' && pick === null)) return next(e)
+    if (e.props.hasSurvey || (result === null && note === '')) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const width = Math.max(10, Math.min(24, e.props.bodyColumns - 50))
     const rows = Math.max(1, Math.min(5, e.props.maxRows - 2))
@@ -379,21 +356,6 @@ export const register: Register = (on, options) => {
     const nextMode = MODES[(MODES.indexOf(current) + 1) % MODES.length] ?? 'observe'
     // Bands of other mods, drawn under this one
     const below = await next(e)
-
-    const headline =
-      current === 'pick' ? (
-        pick ? (
-          <Text color="green"> · loads {pick}</Text>
-        ) : (
-          <Text dimColor> · choose a skill below, or none loads</Text>
-        )
-      ) : result?.winner ? (
-        <Text color="green">
-          {' '}· {current === 'block' ? 'would load' : current === 'steer' ? 'loads' : 'pick'} {result.winner}
-        </Text>
-      ) : result ? (
-        <Text dimColor> · no skill</Text>
-      ) : null
 
     return (
       <Box flexDirection="column">
@@ -406,41 +368,31 @@ export const register: Register = (on, options) => {
               <Text dimColor> {current}</Text>
               {result && (
                 <Text>
-                  {' '}· gate <Text bold>{result.gate.toFixed(2)}</Text>
+                  {' '}· gate <Text bold>{result.gate.toFixed(2)}</Text> ·{' '}
+                  {result.winner ? (
+                    <Text color="green">
+                      {current === 'block' ? 'would load' : current === 'steer' ? 'loads' : 'pick'} {result.winner}
+                    </Text>
+                  ) : (
+                    <Text dimColor>no skill</Text>
+                  )}
+                  <Text dimColor> · {result.ms}ms</Text>
                 </Text>
               )}
-              {headline}
-              {result && <Text dimColor> · {result.ms}ms</Text>}
               {note !== '' && <Text color="yellow"> {note}</Text>}
             </Text>
           </Box>
           <Button key="mode" hotkey="m" label={`mode: ${nextMode}`} onPress={() => setMode($, nextMode)} />
           <Button key="pane" hotkey="s" label="skills" onPress={() => $.ui.open({ id: PANE, title: 'Jev skills' })} />
         </Box>
-        {result?.ranked.slice(0, rows).map((entry, i) => {
-          const line = (
-            <Text wrap="truncate-end" color={entry.name === (current === 'pick' ? pick : result.winner) ? 'green' : undefined}>
-              {entry.probability.toFixed(2)} {bar(entry.probability)} {entry.name}
-              {result.fits[entry.name] !== undefined ? (
-                <Text dimColor> fits {result.fits[entry.name]?.toFixed(2)}</Text>
-              ) : null}
-              {current === 'pick' && entry.name === result.winner ? <Text dimColor> (Jev)</Text> : null}
-            </Text>
-          )
-          // Pick mode: the top rows are buttons, 1 to 3 once the band has focus (ctrl+x tab)
-          return current === 'pick' ? (
-            <Button
-              key={`choose:${entry.name}`}
-              plain
-              hotkey={i < 9 ? String(i + 1) : undefined}
-              onPress={() => choose($, entry.name)}
-            >
-              {line}
-            </Button>
-          ) : (
-            <Box key={entry.name}>{line}</Box>
-          )
-        })}
+        {result?.ranked.slice(0, rows).map(entry => (
+          <Text key={entry.name} wrap="truncate-end" color={entry.name === result.winner ? 'green' : undefined}>
+            {entry.probability.toFixed(2)} {bar(entry.probability)} {entry.name}
+            {result.fits[entry.name] !== undefined ? (
+              <Text dimColor> fits {result.fits[entry.name]?.toFixed(2)}</Text>
+            ) : null}
+          </Text>
+        ))}
         {below}
       </Box>
     )
@@ -452,7 +404,6 @@ export const register: Register = (on, options) => {
     const off = new Set(await read($, disabled))
     const current = await read($, mode)
     const result = await read($, verdict)
-    const pick = await read($, chosen)
     const isOn = await read($, enabled)
     const probability = new Map(result?.ranked.map(entry => [entry.name, entry.probability]) ?? [])
     const sorted = [...skills].sort(
@@ -475,7 +426,7 @@ export const register: Register = (on, options) => {
           ))}
         </Box>
         <Text dimColor>
-          observe: Claude picks as usual · block: no skill loads · steer: only Jev's pick loads · pick: you choose
+          observe: Claude picks as usual · block: no skill loads · steer: only Jev's pick loads
         </Text>
         <Text dimColor>
           {skills.length} skills, {off.size} off{result ? ` · last: "${result.text.slice(0, 40)}"` : ''}
@@ -488,15 +439,7 @@ export const register: Register = (on, options) => {
               label={off.has(skill.name) ? '[ ]' : '[x]'}
               onPress={() => toggle($, skill.name)}
             />
-            {current === 'pick' && !off.has(skill.name) ? (
-              <Button
-                key={`choose:${skill.name}`}
-                plain
-                label={pick === skill.name ? '(•)' : '( )'}
-                onPress={() => choose($, skill.name)}
-              />
-            ) : null}
-            <Text dimColor={off.has(skill.name)} color={pick === skill.name ? 'green' : undefined} wrap="truncate-end">
+            <Text dimColor={off.has(skill.name)} wrap="truncate-end">
               {' '}
               {probability.has(skill.name) ? probability.get(skill.name)!.toFixed(2) : '    '}{' '}
               {skill.name}

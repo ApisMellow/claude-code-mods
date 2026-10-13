@@ -137,33 +137,13 @@ test('/jev off is kept across sessions', async ($, on) => {
   expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toBe(undefined)
 })
 
-test('pick mode: the skill chosen in the band rides along, and only it may load', async ($, on) => {
-  let context: readonly string[] = []
-  on('prompt.submit', (_$, e) => {
-    context = e.context ?? []
-    return { text: e.text } as never
-  })
-  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }) as never)
-  // Another mod's band beneath this one
+test('the band keeps other mods\' bands beneath it', async ($, on) => {
+  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', children: ['other band'] }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
   await start($, on, { mode: 'steer' })
-  await $.prompt.submit({ text: 'split the pane and run the tests' } as never) // scores: herdr, then linkedin
-  await $.command.run({ command: 'jev', args: 'pick' } as never)
-
+  await $.prompt.submit({ text: 'split the pane and run the tests' } as never) // scores, so Jev's band shows
   const ui = await $.ui.mount({ plugin: 'jev-skill-suggestion', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS } as never)
+  expect(await ui.find({ type: 'Text', text: /herdr/ } as never)).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /other band/ } as never)).toBeDefined()
-  await ui.press({ key: 'choose:linkedin' } as never)
-  await $.prompt.submit({ text: 'write it up as a post' } as never)
-  expect(context.join('')).toMatch(/The user chose the skill linkedin/)
-  expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toMatch(/linkedin/)
-  expect((await $.tool.call({ tool: 'Skill', skill: 'linkedin' })).deny).toBe(undefined)
-})
-
-test('pick mode with nothing chosen loads no skill', async ($, on) => {
-  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
-  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }) as never)
-  await start($, on, { mode: 'pick' })
-  await $.prompt.submit({ text: 'split the pane and run the tests' } as never)
-  expect((await $.tool.call({ tool: 'Skill', skill: 'herdr' })).deny).toMatch(/\(none\)/)
 })
