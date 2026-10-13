@@ -56,6 +56,11 @@ function guard(text: string, next: Budget): void {
 const PUBLISHES =
   /\bgit\b(?:[ \t]+-[cC][ \t]+\S+|[ \t]+--?[\w-]+(?:=\S+)?)*[ \t]+(?:commit|tag|notes|send-email)\b|\bgh[ \t]+(?:issue|pr|release|gist|discussion|api|repo[ \t]+(?:create|edit))\b/
 
+// A restored value goes into Bash as shell source. One holding any of these
+// (quotes, $, backticks, separators, globs) could run as code there, so it is
+// never put into a command. Most keys are letters, digits and -_.+/=:
+const SHELL_ACTIVE = /[\s$`"'\\;&|<>()*?[\]{}#~]|[\x00-\x1f\x7f]/
+
 // @-mentioned files the engine attaches as media or a page reference, never
 // as text. When one is too large for $.fs.read it holds no text to check.
 const MEDIA_FILE = /\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic|pdf)$/i
@@ -116,6 +121,11 @@ export const register: Register = (on, options) => {
       return out
     }
     const input = isLocal ? (walk({ ...e }, restoreTracked) as typeof e) : e
+    if (e.tool === 'Bash' && [...handed].some((v) => SHELL_ACTIVE.test(v))) {
+      return {
+        deny: `${brand.name}: a secret in this command holds shell characters, so its real value was not put into Bash, where it could run as code. Write it to a file with the Write tool and have the command read that file instead.`,
+      }
+    }
     const r = await next(input)
     if (r.deny !== undefined) {
       // A refusal from beneath may quote the input it refused, real values

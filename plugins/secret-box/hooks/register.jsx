@@ -178,16 +178,41 @@ async function learnDotenv($, files) {
   }
 }
 
+// The repositories a command's git calls run in: each `git -C <dir>`, and the
+// session's own repository for a plain `git`
+function gitDirs(cmd) {
+  const dirs = new Set()
+  for (const m of cmd.matchAll(/\bgit((?:[ \t]+-c[ \t]+\S+|[ \t]+-C[ \t]+(?:"[^"]*"|'[^']*'|\S+))*)/g)) {
+    const c = m[1].match(/-C[ \t]+("[^"]*"|'[^']*'|\S+)/g)
+    if (!c) dirs.add('')
+    else dirs.add(c.at(-1).replace(/^-C[ \t]+/, '').replace(/^["']|["']$/g, ''))
+  }
+  return [...dirs]
+}
+
 // Why a Bash command must be blocked: it stages or commits a .env file
 async function commitBlockReason($, cmd) {
   if (/\bgit\b[^;&|]*\badd\b/.test(cmd) && /\.env\b(?!\.(example|sample|template|dist))/.test(cmd)) {
     return 'staging a .env file is blocked.'
   }
-  if (/\bgit\b[^;&|]*\bcommit\b/.test(cmd)) {
-    const staged = await $.process.run(['git', 'diff', '--cached', '--name-only'])
-    const all = /\s(-a|--all|-\w*a\w*)\b/.test(cmd) ? await $.process.run(['git', 'diff', '--name-only']) : { stdout: '' }
-    const files = (staged.stdout + '\n' + all.stdout).split('\n')
-    if (files.some(isEnvFile)) return 'this commit would include a .env file. Unstage it with git rm --cached.'
+  if (!/\bgit\b[^;&|]*\bcommit\b/.test(cmd)) return ''
+  // The index is read before the command runs. If the same command stages
+  // (git add ... && git commit, or commit -a), count what it could stage too:
+  // every changed or untracked file git does not ignore.
+  const stages = /\bgit\b[^;&|]*\b(add|stage)\b/.test(cmd) || /\bcommit\b[^;&|]*\s(-a|--all|-\w*a\w*)\b/.test(cmd)
+  for (const dir of gitDirs(cmd)) {
+    const git = (...args) => $.process.run(['git', ...(dir ? ['-C', dir] : []), ...args])
+    const checks = [git('diff', '--cached', '--name-only')]
+    if (stages) checks.push(git('ls-files', '--modified', '--others', '--exclude-standard'))
+    for (const r of await Promise.all(checks)) {
+      if (r.exitCode !== 0) return `could not check what this commit includes${dir ? ' in ' + dir : ''}, so it is blocked.`
+      const env = r.stdout.split('\n').find(isEnvFile)
+      if (env) {
+        return stages
+          ? `this command could stage and commit ${env}. Add it to .gitignore, or stage named files in a separate step.`
+          : 'this commit would include a .env file. Unstage it with git rm --cached.'
+      }
+    }
   }
   return ''
 }

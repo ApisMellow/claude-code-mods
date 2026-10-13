@@ -119,3 +119,43 @@ test('a .env file that cannot be checked still runs, and is scanned', async ($, 
   // learnDotenv swallows a read error, so the call still runs and is scanned
   expect((await call($, { tool: 'Read', file_path: '/repo/.env' })).result).toBe('ran')
 })
+
+// git answers per subcommand: `index` for what is staged, `tree` for what is
+// changed or untracked, `fails` for a git call that errors. `argvs` keeps every call.
+function gitStub(on: any, opts: { index?: string; tree?: string; fails?: boolean; argvs?: string[][] }) {
+  on('tool.call', () => ({ result: 'ran' }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('fs.exists', () => ({ value: false }))
+  on('process.run', (_$: unknown, e: { argv: string[] }) => {
+    opts.argvs?.push([...e.argv])
+    if (opts.fails) return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository' } }
+    const stdout = e.argv.includes('ls-files') ? opts.tree ?? '' : opts.index ?? ''
+    return { value: { exitCode: 0, stdout, stderr: '' } }
+  })
+}
+
+const STAGE_AND_COMMIT: [string, string, string, boolean][] = [
+  ['git add -A && git commit with an untracked .env.production', 'git add -A && git commit -m init', 'src/app.ts\n.env.production\n', true],
+  ['git add -A && git commit with no .env around', 'git add -A && git commit -m init', 'src/app.ts\n', false],
+  ['git commit -am with a changed .env.local', 'git commit -am wip', 'config/.env.local\n', true],
+  ['git commit with an untracked .env it does not stage', 'git commit -m wip', '.env\n', false],
+]
+for (const [name, command, tree, isBlocked] of STAGE_AND_COMMIT) {
+  test(name, async ($, on) => {
+    gitStub(on, { tree })
+    expect(Boolean((await call($, { tool: 'Bash', command })).deny)).toBe(isBlocked)
+  })
+}
+
+test('git -C checks the repository it names', async ($, on) => {
+  const argvs: string[][] = []
+  gitStub(on, { index: '.env\n', argvs })
+  const r = await call($, { tool: 'Bash', command: 'git -C ../other commit -m wip' })
+  expect(Boolean(r.deny)).toBe(true)
+  expect(argvs.some((a) => a.join(' ') === 'git -C ../other diff --cached --name-only')).toBe(true)
+})
+
+test('a commit is blocked when git cannot say what it includes', async ($, on) => {
+  gitStub(on, { fails: true })
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git commit -m wip' })).deny)).toBe(true)
+})
