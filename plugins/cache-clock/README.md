@@ -11,7 +11,7 @@ Every request to the model writes the conversation to the prompt cache. If the n
 - At zero it says `cache cold`, and a toast tells you the next message is a full-price write.
 - The TTL is read from the session itself: the API records whether each cache write was a 1 hour or a 5 minute one, and the band says `measured` once it has seen one.
 - At the warning, if Claude is idle and you haven't replied, it acts while the cache is still warm. You pick what it does in the plugin's settings (`onWarning`):
-  - `handoff` (the default): Claude writes a `HANDOFF.md` in the session's folder, in case you don't come back.
+  - `handoff` (the default): Claude writes a handoff note, `HANDOFF-<first 8 characters of the session id>.md`, in the project root, in case you don't come back. Each session has its own file, so parallel sessions in one folder don't overwrite each other.
   - `compact`: the session compacts, as `/compact` does. The summary request reads the warm cache, so it is cheap, and your next message after the cache goes cold re-sends a few thousand tokens instead of the whole context.
   - `off`: just the toast.
 
@@ -40,6 +40,7 @@ Or inside Claude Code: `/plugin marketplace add ray-amjad/claude-code-mods`, the
 | `CACHE_CLOCK_WARN_MIN` | 5 | Toast, the onWarning action and the colour red when this much is left |
 | `CACHE_CLOCK_ON_WARNING` | the setting | `handoff`, `compact` or `off`; overrides the plugin setting |
 | `CACHE_CLOCK_AUTO_HANDOFF` | on | `0` means `off` (kept from older versions) |
+| `CACHE_CLOCK_HANDOFF_DIR` | project root | Folder the handoff notes go to |
 | `CACHE_CLOCK_SOUND` | off | `1` plays `sounds/cooling.wav` with the warning toast |
 
 To watch the whole cycle in two minutes:
@@ -61,7 +62,7 @@ CACHE_CLOCK_MAIN_TTL_MIN=2 CACHE_CLOCK_WARN_MIN=1.5 claude
 - A message sent while the band says cold still works; it is just a full-price cache write.
 - If none of the last 300 transcript lines wrote to the cache, the TTL keeps its previous or default value and is labelled `assumed`.
 - State lives in memory, so after a hot reload the clock waits for the next turn.
-- Each handoff overwrites the previous `HANDOFF.md`, and it fires even if you have a draft typed but not sent (the draft stays in the box).
+- A later handoff in the same session overwrites that session's note, and it fires even if you have a draft typed but not sent (the draft stays in the box).
 - In a narrow terminal the line drops pieces from the right (the TTL label, then `sub`, then ctx) instead of wrapping.
 
 ## Develop
