@@ -23,7 +23,9 @@ A band above the prompt shows the gate, the top skills with their probabilities,
 | `block` | No skill listing | Nothing: the model's `Skill` calls are refused |
 | `steer` | No skill listing, plus a hidden note naming Jev's pick | Only Jev's pick |
 
-Switch with `/jev observe`, `/jev block` or `/jev steer`, or the mode button in the band. `/jev` opens a pane with a checkbox per skill: a skill you untick is left out of Jev's ranking, out of Claude's listing, and refused if Claude asks for it. The mode and the unticked skills are kept across sessions.
+Switch with `/jev observe`, `/jev block` or `/jev steer`, or the mode button in the band.
+
+`/jev off` turns the mod off: nothing is scored or sent to TypeSafe, the band goes away, and Claude picks skills as usual. `/jev on` turns it back on. The pane has the same switch. `/jev` opens a pane with a checkbox per skill: a skill you untick is left out of Jev's ranking, out of Claude's listing, and refused if Claude asks for it. The mode, on or off, and the unticked skills are kept across sessions.
 
 Skills you type yourself as slash commands always run.
 
