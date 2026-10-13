@@ -290,3 +290,24 @@ test('R27 a workflow agent with no key starts as usual', async ($, on) => {
   expect(Boolean(r.deny)).toBe(false)
   expect(started).toBe(true)
 })
+
+// A secret read from an untrusted file may hold shell syntax. Restored into
+// Bash it would run as code, so Bash is refused; Write still gets the value.
+const SHELL_VALUES: [string, string][] = [
+  ['command substitution', 'Xq9' + '$(touch /tmp/pwned)' + 'Lm2'],
+  ['backticks', 'Xq9' + '`touch /tmp/pwned`' + 'Lm2'],
+  ['a double quote', 'Xq9vR7' + '"' + ';id;' + 'Lm2'],
+]
+for (const [name, pw] of SHELL_VALUES) {
+  test(`a restored secret holding ${name} never reaches Bash`, async ($, on) => {
+    const seen = tools(on, (e) => ({ result: e.command === 'cat .env' ? `DB_PASSWORD='${pw}'\n` : 'ok' }))
+    const r1 = await call($, { tool: 'Bash', command: 'cat .env' })
+    const tag = String(r1.result).match(TAG)?.[0]
+    expect(tag).toBeDefined()
+    const r2 = await call($, { tool: 'Bash', command: `psql "postgres://app:${tag}@db/app"` })
+    expect(r2.deny).toContain('shell characters')
+    expect(JSON.stringify(seen)).not.toContain(pw)
+    await call($, { tool: 'Write', file_path: '/tmp/pw', content: tag! })
+    expect(String(seen.at(-1).content)).toBe(pw)
+  })
+}
