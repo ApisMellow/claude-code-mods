@@ -66,6 +66,7 @@ The pane opens on its own in a terminal 144 columns or wider. Narrower than that
 - Edges that skip a row or point back up are not routed. They are listed under the drawing with `⇢` and `↺`. A row too wide for the pane wraps, and edges into the wrapped part are listed the same way.
 - ASCII diagrams are only picked up from plain code blocks (no language, or `text`), and shown as written.
 - The map check runs after a turn ends, not while Claude is working. Before the first reply there is nothing to fork, and `/diagram` says so.
+- The map, edits and view are saved per install: moving the plugin to another marketplace or reinstalling it starts with no saved maps. A session that already has `everyTurns` turns of work gets a fresh map at its next turn or `diagram_get`, without waiting.
 - The map is the model's own summary of the work, so it can include a step such as "run tests" beside the files.
 
 ## Develop
