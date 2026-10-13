@@ -1,4 +1,4 @@
-export type Mode = 'observe' | 'block' | 'steer'
+export type Mode = 'observe' | 'block' | 'steer' | 'pick'
 
 export type Skill = { name: string; description: string; body: string }
 
@@ -18,8 +18,7 @@ declare module 'claude-code' {
     'jev-skill-suggestion': {
       mode: Mode
       enabled: boolean
-      // steer: the person's own choice for the prompt being written; null follows Jev
-      chosen: { name: string | null } | null
+      chosen: string | null
       disabled: string[]
       roster: Skill[]
       verdict: Verdict | null
