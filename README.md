@@ -27,7 +27,7 @@ Answer `y` to add the marketplace, then pick a scope. Or add the marketplace onc
 | [decision-tree](plugins/decision-tree) | When Claude ends a reply with a question, explains the choice in a side pane and lets you explore any option, or your own, in a real forked session. |
 | [diagram-pane](plugins/diagram-pane) | A side pane that pins every diagram Claude draws and keeps a live map of the work. |
 | [dream-pass](plugins/dream-pass) | A dreaming pass over Claude's memory folder: merges duplicates, rewrites stale entries, removes dead ones and tidies MEMORY.md, with a backup and undo. |
-| [jev-skill-suggestion](plugins/jev-skill-suggestion) | Scores every skill against your prompt with TypeSafe Jev as you type. Observe, block or steer which skill loads. |
+| [jev-skill-suggestion](plugins/jev-skill-suggestion) | Scores every skill against your prompt with TypeSafe Jev as you type. Observe, block or steer which skill loads, or pick it yourself. |
 | [memory-fork](plugins/memory-fork) | Keeps auto-memory up to date in the background: after each turn Haiku decides whether memory needs a change, and a tool-less fork of the session drafts it. |
 | [prompt-bouncer](plugins/prompt-bouncer) | Bounces vague prompts before Claude sees them, and suggests the project's own term. |
 | [secret-box](plugins/secret-box) | Claude uses a secret without seeing it: a masked box saves keys to `.env`, Claude gets a placeholder, and committing `.env` is refused. |
