@@ -33,8 +33,8 @@
     {
       "name": "diagram-pane",
       "source": "./plugins/diagram-pane",
-      "description": "A side pane that pins every diagram Claude draws and keeps a live map of the work",
-      "version": "0.1.0",
+      "description": "A side pane that pins every diagram Claude draws, keeps a live map of the work, and lets you go into boxes and change them",
+      "version": "0.2.0",
       "author": {
         "name": "Ray Amjad"
       },
