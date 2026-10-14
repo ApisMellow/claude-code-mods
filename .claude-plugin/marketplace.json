@@ -44,7 +44,7 @@
       "name": "dream-pass",
       "source": "./plugins/dream-pass",
       "description": "A dreaming pass over Claude's memory folder: merges duplicates, rewrites stale entries, removes dead ones and tidies MEMORY.md, with a backup and undo",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "Ray Amjad"
       },
