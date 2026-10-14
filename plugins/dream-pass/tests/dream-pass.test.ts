@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import {
-  aliveArgv, conversationSince, dropDeadPointers, indexProblems, isWindowsPath, keywords, originIds, parentDir, parsePlan, redirectLinks, removeArgv, renameArgv,
+  commandFor, conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parentDir, parsePlan, redirectLinks,
   safeName, snippets, summary, suspects, userRows,
 } from '../hooks/register.js'
 
@@ -119,22 +119,22 @@ test('userRows keeps the user rows of a transcript, LF or CRLF, with no grep', a
   expect(userRows('')).toEqual([])
 })
 
-test('where rm, mv and kill are missing, node deletes, renames and checks liveness with the paths as arguments', async () => {
-  const rm = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
-  expect(rm.slice(0, 2)).toEqual(['node', '-e'])
-  expect(rm.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])
-  expect(rm[2]).toMatch(/rmSync\(p, \{ force: true \}\)/)
-  const mv = renameArgv('/m/.dream-backup/1', '/m/.dream-backup/undone-1')
-  expect(mv.slice(0, 2)).toEqual(['node', '-e'])
-  expect(mv.slice(3)).toEqual(['/m/.dream-backup/1', '/m/.dream-backup/undone-1'])
-  const alive = aliveArgv(4242)
-  expect([alive[0], alive[1], alive[3]]).toEqual(['node', '-e', '4242'])
-  expect(alive[2]).toMatch(/process\.kill\(/)
+test('Mac and Linux use rm, mv, kill and grep, as before', async () => {
+  expect(commandFor(false, 'remove', ['/m/a.md', '/m/b c.md'])).toEqual([['rm', '-f', '/m/a.md', '/m/b c.md'], {}])
+  expect(commandFor(false, 'rename', '/m/1', '/m/undone-1')).toEqual([['mv', '/m/1', '/m/undone-1'], {}])
+  expect(commandFor(false, 'alive', 4242)).toEqual([['kill', '-0', '4242'], {}])
+  expect(commandFor(false, 'userRows', '/t/s.jsonl')).toEqual([['grep', '-E', '"type": ?"user"', '/t/s.jsonl'], {}])
 })
 
-test('a memory folder on a drive or a share is a Windows path, so liveness skips MSYS kill', async () => {
-  expect(isWindowsPath('C:\\Users\\User\\.claude\\projects\\p\\memory')).toBe(true)
-  expect(isWindowsPath('c:/Users/User/.claude/projects/p/memory')).toBe(true)
-  expect(isWindowsPath('\\\\server\\share\\memory')).toBe(true)
-  expect(isWindowsPath('/home/u/.claude/projects/p/memory')).toBe(false)
+test('Windows uses PowerShell, with each path in an env var and never in the script', async () => {
+  const paths = ['C:\\m\\a.md', "C:\\m\\b c'; rm -r x.md"]
+  for (const [job, arg, to] of [['remove', paths], ['rename', 'C:\\m\\1', 'C:\\m\\undone-1'], ['alive', 4242], ['userRows', 'C:\\t\\s.jsonl']] as const) {
+    const [argv, init] = commandFor(true, job, arg, to)
+    expect(argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+    expect(argv[4]).toContain('$env:DREAM_PASS_ARG')
+    for (const p of [paths, arg, to].flat()) if (p !== undefined) expect(argv[4]).not.toContain(String(p))
+  }
+  expect(commandFor(true, 'remove', paths)[1]).toEqual({ env: { DREAM_PASS_ARG: paths.join('\n') } })
+  expect(commandFor(true, 'rename', 'C:\\m\\1', 'C:\\m\\undone-1')[1]).toEqual({ env: { DREAM_PASS_ARG: 'C:\\m\\1', DREAM_PASS_TO: 'C:\\m\\undone-1' } })
+  expect(commandFor(true, 'alive', 4242)[1]).toEqual({ env: { DREAM_PASS_ARG: '4242' } })
 })

@@ -56,17 +56,30 @@ const memoryDir = async ($: EngineInterface) => {
   return `${config}/projects/${slug}/memory`
 }
 
-// $.fs has no remove, so where there is no rm node deletes the files, with the paths as arguments: no shell, no quoting.
-export const removeArgv = (paths: string[]) => [
-  'node',
-  '-e',
-  'for (const p of process.argv.slice(1)) require("fs").rmSync(p, { force: true })',
-  ...paths,
-]
+// $.fs has no remove, so a command deletes. A native Windows terminal has no
+// rm, and node is not promised there, so PowerShell does it, which every
+// Windows has. The paths go in an env var, never in the script, so nothing in
+// a path can run as code.
+export const removeCommand = (isWindows: boolean, paths: string[]): [string[], { env?: Record<string, string> }] =>
+  isWindows
+    ? [
+        [
+          'powershell',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          'foreach ($p in ($env:MEMORY_FORK_PATHS -split "`n")) { if ($p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }',
+        ],
+        { env: { MEMORY_FORK_PATHS: paths.join('\n') } },
+      ]
+    : [['rm', '-f', ...paths], {}]
+
+// C:\x, C:/x, or a share: \\server\x or //server/x
+const WINDOWS_PATH = /^([A-Za-z]:[\\/]|\\\\|\/\/)/
 
 // Whether path is inside dir, with / or \ as the separator. Windows paths are compared without case.
 export const isInside = (path: string, dir: string) => {
-  const windows = /^[A-Za-z]:[\\/]/.test(dir)
+  const windows = WINDOWS_PATH.test(dir) || WINDOWS_PATH.test(path)
   const norm = (p: string) => (windows ? p.replace(/\\/g, '/').toLowerCase() : p)
 
   return norm(path).startsWith(`${norm(dir)}/`)
@@ -185,8 +198,8 @@ async function write($: EngineInterface) {
   for (const one of ops.write) await $.fs.write(`${dir}/${one.name}`, one.content)
   if (ops.delete.length > 0) {
     const paths = ops.delete.map(name => `${dir}/${name}`)
-    // A native Windows terminal has no rm: $.process.run throws ENOENT, so node deletes them instead
-    await $.process.run(['rm', '-f', ...paths]).catch(() => $.process.run(removeArgv(paths)))
+    const [argv, init] = removeCommand((await $.env.get('OS')) === 'Windows_NT', paths)
+    await $.process.run(argv, init)
   }
 
   await setRun($, id, { status: 'done', changes: diff(before, await readMemory($, dir)) })

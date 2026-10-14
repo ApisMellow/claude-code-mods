@@ -183,16 +183,15 @@ export async function findLinkedBelow(
 ): Promise<string | null> {
   let level = [root]
   for (let depth = 0; depth <= 2 && level.length > 0; depth++) {
-    const below: string[] = []
-    for (const dir of level) {
-      const entries = await list(dir).catch(() => [] as Entry[])
-      const dirs = entries.filter((e) => e.kind === 'dir')
-      if (dirs.some((e) => e.name === '.vercel') && (await exists(`${dir}/.vercel/project.json`).catch(() => false))) {
-        return dir
-      }
-      for (const e of dirs) if (e.name !== 'node_modules' && !e.name.startsWith('.')) below.push(`${dir}/${e.name}`)
-    }
-    level = below
+    // Each level is listed at once, not one folder after another
+    const listed = await Promise.all(level.map(async (dir) => {
+      const dirs = (await list(dir).catch(() => [] as Entry[])).filter((e) => e.kind === 'dir')
+      const linked = dirs.some((e) => e.name === '.vercel') && (await exists(`${dir}/.vercel/project.json`).catch(() => false))
+      return { dir, dirs, linked }
+    }))
+    const hit = listed.find((l) => l.linked)
+    if (hit) return hit.dir
+    level = listed.flatMap((l) => l.dirs.filter((e) => e.name !== 'node_modules' && !e.name.startsWith('.')).map((e) => `${l.dir}/${e.name}`))
   }
   return null
 }

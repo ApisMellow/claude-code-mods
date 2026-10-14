@@ -122,9 +122,10 @@ export const register: Register = (on, options) => {
   })
 
   on('session.start', async ($, e, next) => {
-    // A -p run has no surface to draw on. (There is no `e.interactive`: the
-    // event has `isInteractive`, so the old check kept the mod off everywhere.)
-    if (e.surface == null) return next(e)
+    // Only where a person is at the prompt: a -p run or the SDK has no band.
+    // (The field is `isInteractive`. The old check read `e.interactive`,
+    // which does not exist, so it kept the mod off everywhere.)
+    if (!e.isInteractive || e.surface == null) return next(e)
 
     const dir = await findLinkedDir($, e.cwd)
     if (!dir) {
@@ -177,10 +178,27 @@ export const register: Register = (on, options) => {
       return inFlightRows().length > 0 || waiting(now)
     }
 
+    // One loop at a time. A push that lands while a poll runs asks for one
+    // more poll right after it, rather than start a second loop beside it.
     let timer: Timer | null = null
+    let polling = false
+    let again = false
     const loop = async () => {
-      const active = await poll()
-      $.ui.invalidate('ui.render')
+      if (polling) {
+        again = true
+        return
+      }
+      polling = true
+      let active = false
+      try {
+        do {
+          again = false
+          active = await poll()
+          $.ui.invalidate('ui.render')
+        } while (again)
+      } finally {
+        polling = false
+      }
       timer = $.clock.after(active ? activeMs : idleMs, loop)
     }
 

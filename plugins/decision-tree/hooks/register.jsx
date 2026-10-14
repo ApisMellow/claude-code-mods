@@ -167,7 +167,8 @@ async function lastAssistantId($, sid, answer) {
     home + '/.claude/projects/' + (await $.session.cwd()).replace(/[^a-zA-Z0-9]/g, '-')
   const file = folder + '/' + sid + '.jsonl'
   if (!(await $.fs.exists(file))) return undefined
-  const lines = (await $.fs.read(file)).split('\n')
+  // A transcript past $.fs.read's 4 MiB cannot be searched: fork from the latest point
+  const lines = (await $.fs.read(file).catch(() => '')).split('\n')
   const want = (answer || '').trim().slice(-60)
   for (let n = lines.length - 1; n >= 0; n--) {
     let row

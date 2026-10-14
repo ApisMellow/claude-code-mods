@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { diff, isInside, lastExchange, lineDiff, parseOps, removeArgv, totals } from '../hooks/register'
+import { diff, isInside, lastExchange, lineDiff, parseOps, removeCommand, totals } from '../hooks/register'
 
 test('diff names added, updated and deleted memories with their line counts', async () => {
   const before = new Map([['a.md', 'one\ntwo\n'], ['b.md', 'one\ntwo\nthree\n'], ['c.md', 'gone\nalso gone\n']])
@@ -72,9 +72,16 @@ test('isInside takes / or \\ on Windows, and only / elsewhere', async () => {
   expect(isInside('/home/r/.claude/projects/-w/memoryx/a.md', '/home/r/.claude/projects/-w/memory')).toBe(false)
 })
 
-test('where rm is missing, node deletes with the paths as arguments', async () => {
-  const argv = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
-  expect(argv.slice(0, 2)).toEqual(['node', '-e'])
-  expect(argv.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])
-  expect(argv[2]).toMatch(/rmSync/)
+test('isInside normalises a share path too', async () => {
+  expect(isInside('\\\\srv\\share\\.claude\\projects\\p\\memory\\a.md', '//srv/share/.claude/projects/p/memory')).toBe(true)
+  expect(isInside('C:\\Users\\U\\.claude\\projects\\p\\memory\\a.md', 'C:/Users/U/.claude/projects/p/memory')).toBe(true)
+})
+
+test('rm deletes on Mac and Linux; PowerShell on Windows, with the paths in an env var', async () => {
+  expect(removeCommand(false, ['/m/a.md', '/m/b c.md'])).toEqual([['rm', '-f', '/m/a.md', '/m/b c.md'], {}])
+  const paths = ['C:\\m\\a.md', "C:\\m\\b c'; x.md"]
+  const [argv, init] = removeCommand(true, paths)
+  expect(argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+  for (const p of paths) expect(argv[4]).not.toContain(p)
+  expect(init).toEqual({ env: { MEMORY_FORK_PATHS: paths.join('\n') } })
 })

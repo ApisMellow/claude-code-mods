@@ -51,8 +51,7 @@ async function loadConfig($, options) {
 // it wrote to (ephemeral_1h or ephemeral_5m). Read the newest main-thread one.
 async function readTtl($) {
   if (!transcript || cfg.pinned) return
-  const text = await $.fs.read(transcript).catch(() => '')
-  for (const row of lastLines(text, 300).reverse()) {
+  for (const row of (await lastRows($, transcript)).reverse()) {
     if (!row.includes('"cache_creation"')) continue
     let msg
     try { msg = JSON.parse(row) } catch { continue }
@@ -64,8 +63,29 @@ async function readTtl($) {
   }
 }
 
-// The last n lines of a file's text, CRLF or LF. It used to be `tail -n`,
-// which a native Windows terminal does not have.
+// The transcript's last 300 rows. A long session's transcript is past the
+// 4 MiB $.fs.read takes, so a command reads its end: `tail` on Mac and Linux,
+// PowerShell on Windows, which has no tail (the path goes in an env var, not
+// the script). If the command fails, $.fs.read is the last resort.
+export function tailCommand(isWindows, path) {
+  if (!isWindows) return [['tail', '-n', '300', path], {}]
+  const script =
+    '$r = New-Object IO.StreamReader((New-Object IO.FileStream($env:CACHE_CLOCK_FILE, "Open", "Read", "ReadWrite")), [Text.Encoding]::UTF8); ' +
+    '$q = New-Object System.Collections.Generic.Queue[string]; ' +
+    'while ($null -ne ($l = $r.ReadLine())) { $q.Enqueue($l); if ($q.Count -gt 300) { [void]$q.Dequeue() } }; ' +
+    '$b = [Text.Encoding]::UTF8.GetBytes(($q -join "`n") + "`n"); [Console]::OpenStandardOutput().Write($b, 0, $b.Length)'
+  return [['powershell', '-NoProfile', '-NonInteractive', '-Command', script], { env: { CACHE_CLOCK_FILE: path } }]
+}
+async function lastRows($, path) {
+  try {
+    const [argv, init] = tailCommand((await $.env.get('OS')) === 'Windows_NT', path)
+    const r = await $.process.run(argv, init)
+    if (r.exitCode === 0) return lastLines(r.stdout, 300)
+  } catch {}
+  return lastLines(await $.fs.read(path).catch(() => ''), 300)
+}
+
+// The last n lines of a file's text, CRLF or LF
 export function lastLines(text, n) {
   const lines = String(text).split(/\r?\n/)
   if (lines[lines.length - 1] === '') lines.pop()

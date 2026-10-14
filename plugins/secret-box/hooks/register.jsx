@@ -149,20 +149,28 @@ export function register(on, options) {
   }).catch(($, e, next) => next(e))
 }
 
-// One short wait. A native Windows terminal has no `sleep` ($.process.run
-// throws ENOENT), so after the first miss node waits instead.
-const SLEEP = ['sleep', '0.3']
-const NODE_SLEEP = ['node', '-e', 'setTimeout(() => {}, 300)']
-let hasSleep = true
+// One short wait, in a process, so it is not the hook's own time. Mac and
+// Linux have `sleep`. A native Windows terminal does not, so there node waits
+// where it is installed, else ping, which every Windows has (about 1 s).
+export const WAITS = {
+  unix: [['sleep', '0.3']],
+  windows: [['node', '-e', 'setTimeout(() => {}, 300)'], ['ping', '-n', '2', '127.0.0.1']],
+}
+let waits = null
 async function pause($) {
-  if (hasSleep) {
+  waits ||= [...((await $.env.get('OS')) === 'Windows_NT' ? WAITS.windows : WAITS.unix)]
+  for (;;) {
     try {
-      return await $.process.run(SLEEP)
-    } catch {
-      hasSleep = false
+      return await $.process.run(waits[0])
+    } catch (err) {
+      // Only a command that is not there moves on to the next one
+      if (waits.length > 1 && isNotFound(err)) waits.shift()
+      else throw err
     }
   }
-  await $.process.run(NODE_SLEEP)
+}
+export function isNotFound(err) {
+  return /ENOENT|not found/i.test(String((err && err.message) || err))
 }
 
 // .env, .env.local, .env.production ... but not .env.example and friends

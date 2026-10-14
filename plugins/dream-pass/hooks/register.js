@@ -360,7 +360,7 @@ async function undo($, options) {
   for (const [name, text] of Object.entries(saved)) await $.fs.write(dir + '/' + name, text)
   // Retire the used backup, so a second undo goes one dream further back
   const [from, to] = [root + '/' + stamp, root + '/undone-' + stamp]
-  await runPortable($, ['mv', from, to], renameArgv(from, to))
+  await runJob($, 'rename', from, to)
   const run = S.runs.findLast((r) => r.stamp === stamp)
   if (run) finish($, run, { status: 'undone', note: 'restored the backup from ' + stamp })
   else addRun($, { why: 'undo', status: 'undone', note: 'restored the backup from ' + stamp })
@@ -419,7 +419,7 @@ async function transcriptsDir($, dir) {
 async function sessionText($, path) {
   const lines = []
   let date = '?'
-  for (const raw of userRows(await $.fs.read(path).catch(() => ''))) {
+  for (const raw of await userRowsOf($, path)) {
     let o
     try { o = JSON.parse(raw) } catch { continue }
     if (o.isMeta || !o.message) continue
@@ -494,9 +494,7 @@ async function autoDreamRunning($, dir) {
     if (Date.now() - (await $.fs.stat(lock)).mtimeMs > 3600000) return false
     const pid = parseInt((await $.fs.read(lock)).trim(), 10)
     if (!(pid > 0)) return false
-    // On Windows a `kill` on PATH is Git's MSYS one, which does not know Windows PIDs, so ask node
-    const alive = isWindowsPath(dir) ? await $.process.run(aliveArgv(pid)) : await runPortable($, ['kill', '-0', String(pid)], aliveArgv(pid))
-    return alive.exitCode === 0
+    return (await runJob($, 'alive', pid)).exitCode === 0
   } catch {
     return false
   }
@@ -534,38 +532,64 @@ export function parentDir(path) {
   return path.replace(/[\\/][^\\/]+$/, '')
 }
 
-// C:\x, C:/x or \\server\share
-export function isWindowsPath(path) {
-  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
-}
-
 // The rows of a transcript that came from the user (what `grep '"type": ?"user"'` found)
 export function userRows(text) {
   return text.split(/\r?\n/).filter((row) => /"type": ?"user"/.test(row))
 }
 
-// A native Windows terminal has no rm, mv or kill: $.process.run throws
-// ENOENT before it starts. $.fs has no remove or rename either, so then node
-// does the same job, with the paths as arguments: no shell, no quoting.
-async function runPortable($, unix, viaNode) {
+// A transcript's user rows. A command reads the file, so a transcript over
+// $.fs.read's 4 MiB still counts; if the command fails, $.fs.read does it.
+async function userRowsOf($, path) {
   try {
-    return await $.process.run(unix)
-  } catch {
-    return await $.process.run(viaNode)
+    const r = await runJob($, 'userRows', path)
+    if (r.exitCode <= 1) return userRows(r.stdout) // grep exits 1 when nothing matched
+  } catch {}
+  return userRows(await $.fs.read(path).catch(() => ''))
+}
+
+// ---------- commands ----------
+
+// Mac and Linux have rm, mv, kill and grep. A native Windows terminal has none
+// of them ($.process.run throws ENOENT, and a `kill` from Git Bash does not
+// know Windows PIDs), and $.fs has no remove or rename. So on Windows
+// PowerShell does each job: every Windows has it, where node is not promised.
+// A path reaches PowerShell in an environment variable, never in the script,
+// so nothing in a path can run as code.
+const POWERSHELL = {
+  remove: 'foreach ($p in ($env:DREAM_PASS_ARG -split "`n")) { if ($p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }',
+  rename: 'Move-Item -LiteralPath $env:DREAM_PASS_ARG -Destination $env:DREAM_PASS_TO -ErrorAction Stop',
+  alive: 'if (Get-Process -Id $env:DREAM_PASS_ARG -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }',
+  // Read with sharing, as Claude Code may be writing the file; print UTF-8.
+  // Exit 2 on an error, as grep does, so the caller falls back.
+  userRows:
+    'try { $r = New-Object IO.StreamReader((New-Object IO.FileStream($env:DREAM_PASS_ARG, "Open", "Read", "ReadWrite")), [Text.Encoding]::UTF8); ' +
+    '$o = [Console]::OpenStandardOutput(); ' +
+    'while ($null -ne ($l = $r.ReadLine())) { if ($l -match \'"type": ?"user"\') { $b = [Text.Encoding]::UTF8.GetBytes($l + "`n"); $o.Write($b, 0, $b.Length) } } } catch { exit 2 }',
+}
+
+// The argv and env for one job: remove (a list of paths), rename (from, to),
+// alive (a pid: exit 0 while it runs, like `kill -0`) or userRows (a path)
+export function commandFor(isWindows, job, arg, to) {
+  if (isWindows) {
+    const value = Array.isArray(arg) ? arg.join('\n') : String(arg)
+    return [
+      ['powershell', '-NoProfile', '-NonInteractive', '-Command', POWERSHELL[job]],
+      { env: { DREAM_PASS_ARG: value, ...(to === undefined ? {} : { DREAM_PASS_TO: to }) } },
+    ]
   }
+  if (job === 'remove') return [['rm', '-f', ...arg], {}]
+  if (job === 'rename') return [['mv', arg, to], {}]
+  if (job === 'alive') return [['kill', '-0', String(arg)], {}]
+  return [['grep', '-E', '"type": ?"user"', arg], {}]
 }
-export function removeArgv(paths) {
-  return ['node', '-e', 'for (const p of process.argv.slice(1)) require("fs").rmSync(p, { force: true })', ...paths]
+
+async function runJob($, job, arg, to) {
+  const [argv, init] = commandFor((await $.env.get('OS')) === 'Windows_NT', job, arg, to)
+  return $.process.run(argv, init)
 }
-export function renameArgv(from, to) {
-  return ['node', '-e', 'require("fs").renameSync(process.argv[1], process.argv[2])', from, to]
-}
-// Exits 0 while the process is alive, like `kill -0`
-export function aliveArgv(pid) {
-  return ['node', '-e', 'process.kill(Number(process.argv[1]), 0)', String(pid)]
-}
+
 async function removeFiles($, paths) {
-  if (paths.length) await runPortable($, ['rm', '-f', ...paths], removeArgv(paths))
+  if (paths.length) await runJob($, 'remove', paths)
 }
 
 // Memories, not counting the index

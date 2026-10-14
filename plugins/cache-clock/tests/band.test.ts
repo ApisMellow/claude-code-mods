@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { handoffPath, lastLines, pickAction } from '../hooks/register'
+import { handoffPath, lastLines, pickAction, tailCommand } from '../hooks/register'
 
 test('the band draws one line', async ($, on) => {
   on('clock.now', () => ({ value: 1_000_000 }))
@@ -31,4 +31,13 @@ test('lastLines takes the end of LF and CRLF text, like tail -n', async () => {
   expect(lastLines('a\r\nb\r\nc\r\n', 2)).toEqual(['b', 'c'])
   expect(lastLines('a\nb', 5)).toEqual(['a', 'b'])
   expect(lastLines('', 3)).toEqual([])
+})
+
+test('tail reads the end on Mac and Linux; PowerShell on Windows, with the path in an env var', async () => {
+  expect(tailCommand(false, '/t/s.jsonl')).toEqual([['tail', '-n', '300', '/t/s.jsonl'], {}])
+  const path = "C:\\Users\\U\\.claude\\projects\\p\\a'b.jsonl"
+  const [argv, init] = tailCommand(true, path)
+  expect(argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+  expect(argv[4]).not.toContain(path)
+  expect(init).toEqual({ env: { CACHE_CLOCK_FILE: path } })
 })

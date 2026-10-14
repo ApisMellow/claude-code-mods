@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { isAbsolute, isEnvFile } from '../hooks/register'
+import { isAbsolute, isEnvFile, isNotFound, WAITS } from '../hooks/register'
 
 // Fake keys, built at run time so no key-shaped string sits in the repo
 const STRIPE = 'sk_' + 'live_' + 'A1b2C3d4E5f6G7h8J9k0L1m2'
@@ -186,4 +186,11 @@ test('isEnvFile takes the name after a / or a \\', async () => {
 test('isAbsolute knows Unix, drive-letter and UNC paths', async () => {
   for (const p of ['/repo/.env', 'C:\\repo\\.env', 'd:/repo/.env', '\\\\server\\share\\.env']) expect(isAbsolute(p)).toBe(true)
   for (const p of ['.env', 'config\\.env', 'C:.env', '~/.env']) expect(isAbsolute(p)).toBe(false)
+})
+
+test('the box waits with sleep on Mac and Linux, and with node, else ping, on Windows', async () => {
+  expect(WAITS.unix).toEqual([['sleep', '0.3']])
+  expect(WAITS.windows.map(w => w[0])).toEqual(['node', 'ping'])
+  expect(isNotFound(new Error("$.process.run(node) failed to start: ENOENT: Command 'node' not found"))).toBe(true)
+  expect(isNotFound(new Error('timed out'))).toBe(false)
 })
