@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
-import { gateOf, mergeRoster, parseListing, parseSkillMd } from '../hooks/register'
+import { gateOf, homeDir, mergeRoster, parseListing, parseSkillMd } from '../hooks/register'
 
 // A session over a mocked store, no skills on disk, and a Jev that ranks
 // herdr first and says it fits.
@@ -58,6 +58,13 @@ test('the listing decides who exists, the disk brings bodies', () => {
     { name: 'herdr', description: 'long', body: 'BODY' },
     { name: 'plug:in', description: 'p', body: '' },
   ])
+})
+
+test('skills are found under USERPROFILE when HOME is unset, as on Windows', () => {
+  expect(homeDir('/Users/r', undefined)).toBe('/Users/r')
+  expect(homeDir(undefined, 'C:\\Users\\User')).toBe('C:\\Users\\User')
+  expect(homeDir('/Users/r', 'C:\\Users\\User')).toBe('/Users/r')
+  expect(homeDir(undefined, undefined)).toBe('')
 })
 
 test('gate inverts prose_suffices', () => {
