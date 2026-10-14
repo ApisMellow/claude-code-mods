@@ -11,14 +11,17 @@ const call = async ($: any, input: Record<string, unknown>) => (await $.tool.cal
 
 // Stand in for Claude Code beneath the mod: the tool "prints" `output`,
 // git reports `staged`, and .env holds `dotenv`.
-function stubs(on: any, opts: { output?: string; staged?: string; dotenv?: string; seen?: string[] } = {}) {
+function stubs(on: any, opts: { output?: string; staged?: string; dotenv?: string; seen?: string[]; cwd?: string; looked?: string[] } = {}) {
   on('tool.call', (_$: unknown, e: Record<string, unknown>) => {
     opts.seen?.push(String(e.command ?? ''))
     return { result: opts.output ?? 'ran' }
   })
   on('process.run', () => ({ value: { exitCode: 0, stdout: opts.staged ?? '', stderr: '' } }))
-  on('session.cwd', () => ({ value: '/repo' }))
-  on('fs.exists', () => ({ value: opts.dotenv !== undefined }))
+  on('session.cwd', () => ({ value: opts.cwd ?? '/repo' }))
+  on('fs.exists', (_$: unknown, e: { path: string }) => {
+    opts.looked?.push(e.path)
+    return { value: opts.dotenv !== undefined }
+  })
   on('fs.read', () => ({ value: opts.dotenv ?? '' }))
 }
 
@@ -165,9 +168,7 @@ test('a commit is blocked when git cannot say what it includes', async ($, on) =
 test('a Windows .env path is read where it is, and its weak values are hidden', async ($, on) => {
   const plain = 'staple' + 'gunwindow' // letters only: no detector rule fires on it
   const looked: string[] = []
-  stubs(on, { output: `PORT=3000\nADMIN_PASS=${plain}\n`, dotenv: `ADMIN_PASS=${plain}\n` })
-  on('session.cwd', () => ({ value: 'C:\\repo' }))
-  on('fs.exists', (_$: unknown, e: { path: string }) => { looked.push(e.path); return { value: true } })
+  stubs(on, { output: `PORT=3000\nADMIN_PASS=${plain}\n`, dotenv: `ADMIN_PASS=${plain}\n`, cwd: 'C:\\repo', looked })
   const out = String((await call($, { tool: 'Read', file_path: 'C:\\repo\\.env' })).result)
   expect(looked).toContain('C:\\repo\\.env')
   expect(out).not.toContain(plain)
