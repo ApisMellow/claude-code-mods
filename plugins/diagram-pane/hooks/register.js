@@ -14,7 +14,7 @@
 // Claude learns what the pane shows only through those two tools.
 
 import { findDiagrams, parseMermaid, drawGraph, short } from './draw.js'
-import { adoptIds, allIds, applyOps, boxOf, carrySubs, cleanId, levelAt, setLevel, toMermaid } from './graph.js'
+import { adoptIds, allIds, applyOps, boxOf, carrySubs, cleanId, levelAt, setLevel, toMermaid, uniqueIds } from './graph.js'
 
 const PANE = 'diagrams'
 const TOOL_GET = 'mcp__diagram-pane__diagram_get'
@@ -43,6 +43,7 @@ const S = {
   busy: false,       // a gate or fork is running
   sessionId: null,   // the session the state above belongs to
   gen: 0,            // bumped when a new session starts, so late forks drop their reply
+  mapEdits: 0,       // bumped on every hand edit of the map, so a map fork that started before one drops its reply
 }
 
 // /clear keeps the process (session.start does not fire) but starts a new
@@ -51,7 +52,7 @@ function startSession(id) {
   if (S.sessionId !== null && S.sessionId !== id) {
     Object.assign(S, {
       pins: [], seen: new Set(), scanned: 0, sinceMap: 0, map: null, mapAt: 0,
-      edits: {}, view: HOME, loaded: false, caughtUp: false, note: NOTE, gen: S.gen + 1,
+      edits: {}, view: HOME, loading: new Set(), loaded: false, caughtUp: false, note: NOTE, gen: S.gen + 1,
     })
   }
   const changed = S.sessionId !== id
@@ -263,6 +264,7 @@ async function refreshMap($, messages, force) {
     // 2. The fork: the session's own context, asked for JSON. It cannot call tools.
     // /diagram force draws from scratch; otherwise the fork builds on the current map.
     const base = force ? null : S.map
+    const edits = S.mapEdits
     S.note = 'fork: drawing the work map...'
     await redraw($)
     const r = await $.model.fork({ prompt: FORK_PROMPT + (base ? basePrompt(base) : '') })
@@ -276,9 +278,17 @@ async function refreshMap($, messages, force) {
       S.note = 'fork reply was not a graph: ' + short(r.text.replace(/\s+/g, ' '), 60)
       return
     }
-    // Boxes that kept their id and label keep the detail drawn inside them
-    const graph = base ? carrySubs(base.graph, map.graph, { sameLabel: true }) : map.graph
-    S.map = { title: map.title, graph, turn: S.turn, edited: Boolean(base?.edited) }
+    // Someone changed the map while the fork ran: their change wins over a map
+    // drawn from what was there before it
+    if (S.mapEdits !== edits) {
+      S.note = `kept the map as edited at turn ${S.turn}; it refreshes at the next check`
+      return
+    }
+    // Boxes that kept their id and label keep the detail drawn inside them, read
+    // from the map as it is now, so a box opened while the fork ran keeps its detail
+    const now = force ? null : S.map
+    const graph = uniqueIds(now ? carrySubs(now.graph, map.graph, { sameLabel: true }) : map.graph)
+    S.map = { title: map.title, graph, turn: S.turn, edited: Boolean(now?.edited) }
     S.mapAt = messages.length
     S.note = `map drawn at turn ${S.turn}`
     await saveSaved($)
@@ -410,6 +420,8 @@ function actions($) {
     top: () => go(HOME),
     openPin: code => go({ root: 'pin', code, path: [] }),
     edit: text => editByFork($, text),
+    // A surface that cannot move the focus leaves the field to Tab or a click
+    typeChange: () => $.ui.focus({ requestId: PANE, key: inputKey() }).catch(() => {}),
   }
 }
 
@@ -578,6 +590,13 @@ export function setDiagram(view, input) {
   } else if (path.length) throw new Error('that diagram has no boxes to go into yet')
   else if (!mermaid && !ops?.length) throw new Error('that diagram has no boxes yet: give mermaid')
 
+  // Only a new title: the diagram's boxes stay as they are
+  if (!mermaid && !ops?.length) {
+    commitRoot(view, root, { edited: true, title })
+    S.view = { ...view, path }
+    return `Retitled ${crumbs().join(' › ')}.`
+  }
+
   let next = level
   const changes = []
   if (mermaid) {
@@ -594,8 +613,13 @@ export function setDiagram(view, input) {
   if (title) changes.push('retitled it')
   // A detail's ids must not clash with the rest of the tree
   if (path.length) next = adoptIds(next, allIds(setLevel(root, path, { nodes: [], edges: [] })), path.at(-1))
-  commitRoot(view, path.length ? setLevel(root, path, next) : next, { edited: true, title })
+  // A detail with no boxes left is no detail: the box goes back to having none
+  const tree = path.length ? setLevel(root, path, next.nodes.length ? next : null) : next
+  // A box added on top may take an id already used inside a detail: the deeper one is renamed
+  commitRoot(view, uniqueIds(tree), { edited: true, title })
   S.view = { ...view, path }
+  normalizeView()
+  next = levelAt(rootGraph(), S.view.path).graph || { nodes: [], edges: [] }
   return `Changed ${crumbs().join(' › ')}: ${changes.join(', ')}. The pane shows it now:\n` +
     `\`\`\`mermaid\n${toMermaid(next)}\n\`\`\``
 }
@@ -609,6 +633,7 @@ function commitRoot(view, graph, { edited = false, title }) {
       turn: S.map?.turn ?? S.turn,
       edited: Boolean(S.map?.edited || edited),
     }
+    if (edited) S.mapEdits += 1
     return
   }
   const pin = pinOf(view.code)
@@ -651,8 +676,12 @@ async function editByFork($, text) {
       S.note = r.reason === 'nothing-to-fork' ? 'nothing to fork yet: send a prompt first' : 'fork failed: ' + r.reason
       return
     }
+    // The chart is in a code fence, or starts at a line of its own that opens with
+    // flowchart or graph (never at those words inside the prose before it)
     const fenced = r.text.match(/```(?:mermaid)?\s*\n([\s\S]*?)```/)
-    const code = fenced ? fenced[1] : r.text.slice(Math.max(0, r.text.search(/\b(flowchart|graph)\b/)))
+    const start = r.text.search(/^[ \t]*(flowchart|graph)\b/m)
+    if (!fenced && start < 0) throw new Error('the reply had no flowchart')
+    const code = fenced ? fenced[1] : r.text.slice(start)
     setDiagram({ ...view, path: [] }, { path: view.path, mermaid: code })
     S.note = `changed: ${short(text, 40)}`
     await saveSaved($)
@@ -667,25 +696,41 @@ async function editByFork($, text) {
 // What the pane draws
 // ---------------------------------------------------------------------------
 
-// Number the first nine boxes (the keys that open them), mark the box Claude is
-// on, and the boxes that already have a detail inside
-function numbered(graph) {
+// Mark the box Claude is on and the boxes that already have a detail inside.
+// With `keys`, also number the first nine boxes: the keys that open them. Pins on
+// the home view have no keys of their own, so they are drawn without numbers.
+function marked(graph, keys = true) {
   return {
     nodes: graph.nodes.map((n, i) => ({
       ...n,
-      label: (i < 9 ? `${i + 1}·` : '') + (n.now ? '▶ ' : '') + n.label + (n.sub ? ' ▸' : ''),
+      label: (keys && i < 9 ? `${i + 1}·` : '') + (n.now ? '▶ ' : '') + n.label + (n.sub ? ' ▸' : ''),
     })),
     edges: graph.edges,
   }
 }
 
+// A Button per box: the first nine also have their number as a hotkey, the rest
+// are reached with Tab or a click
 function nodeButtons(graph, act) {
-  return graph.nodes.slice(0, 9).map((n, i) => ({
+  return graph.nodes.map((n, i) => ({
     key: 'node:' + n.id,
-    hotkey: String(i + 1),
+    ...(i < 9 ? { hotkey: String(i + 1) } : {}),
     label: short(n.label, 16) + (n.sub ? ' ▸' : ''),
     onPress: () => act?.drill(n.id),
   }))
+}
+
+// The change field's key: one per view, so text typed for one diagram does not
+// follow you into another. A pin is named by its code, not its place in the
+// list, which shifts when a new diagram is pinned.
+function inputKey(view = S.view) {
+  return ['edit', view.root === 'pin' ? 'pin' + hash(view.code || '') : 'map', ...view.path].join('-')
+}
+
+function hash(text) {
+  let h = 5381
+  for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0
+  return h.toString(36)
 }
 
 // Items of { text, color, bold, dim }, { buttons, lead? } or { input }, cut to `w` columns
@@ -694,10 +739,13 @@ function paneItems(w, act) {
   const out = []
   const add = (text, style = {}) => out.push({ text, ...style })
   const rule = () => add('─'.repeat(w), { dim: true })
-  const input = placeholder => out.push({
-    // One field per view, so text typed for one diagram does not follow you into another
-    input: { key: ['edit', S.view.root === 'pin' ? 'pin' + S.pins.indexOf(pinOf(S.view.code)) : 'map', ...S.view.path].join('-'), placeholder, submitLabel: 'change', onSubmit: value => act?.edit(value) },
-  })
+  // The change field, and a c key that moves the focus into it: number keys and
+  // b and t stay hotkeys, and the person need not Tab past every box to type
+  const input = placeholder => {
+    out.push({ buttons: [{ key: 'change', hotkey: 'c', label: 'type a change', onPress: () => act?.typeChange() }] })
+    out.push({ input: { key: inputKey(), placeholder, submitLabel: 'change', onSubmit: value => act?.edit(value) } })
+    add('keys work once the pane has focus: click it, ctrl+x tab, or /diagram open', { dim: true })
+  }
 
   // Inside a box, or a pin opened on its own: that one diagram
   if (!isHome()) {
@@ -710,7 +758,7 @@ function paneItems(w, act) {
     const { graph, node } = levelAt(rootGraph(), v.path)
     const pin = v.root === 'pin' ? pinOf(v.code) : null
     if (graph) {
-      for (const l of drawGraph(numbered(graph), w)) add(l, { color: v.root === 'map' ? 'cyan' : undefined })
+      for (const l of drawGraph(marked(graph), w)) add(l, { color: v.root === 'map' ? 'cyan' : undefined })
       out.push({ buttons: nodeButtons(graph, act) })
     } else if (node) {
       add(S.loading.has(viewKey(v)) ? `… drawing the inside of ${node.label}` : `${node.label} has no detail yet.`, { dim: true })
@@ -725,7 +773,7 @@ function paneItems(w, act) {
   add(spread('◆ LIVE WORK MAP', S.map ? `turn ${S.map.turn}${S.map.edited ? ', edited' : ''}` : '', w), { bold: true, color: 'cyan' })
   if (S.map) {
     add(S.map.title, { bold: true })
-    for (const l of drawGraph(numbered(S.map.graph), w)) add(l, { color: 'cyan' })
+    for (const l of drawGraph(marked(S.map.graph), w)) add(l, { color: 'cyan' })
     add('┌ file  ╭ component  ╔ step  ▶ now  ▸ has detail', { dim: true })
   }
   add((S.busy ? '… ' : '') + S.note, { dim: true })
@@ -742,7 +790,7 @@ function paneItems(w, act) {
     const what = p.graph ? `flowchart, ${p.graph.nodes.length} boxes` : p.kind === 'mermaid' ? 'mermaid' : 'box diagram'
     const head = short(`${i + 1}. ${p.title || what} · turn ${p.turn}${p.edited ? ' · edited' : ''}`, w - 12)
     out.push({ lead: head, buttons: [{ key: 'pin:' + i, label: 'open ▸', onPress: () => act?.openPin(p.code) }] })
-    if (p.graph) for (const l of drawGraph(numbered(p.graph), w)) add(l)
+    if (p.graph) for (const l of drawGraph(marked(p.graph, false), w)) add(l)
     else {
       // Not a flowchart we can draw: show the code as written, dimmed for mermaid
       if (p.kind === 'mermaid') add('(raw mermaid: only flowcharts are drawn)', { dim: true })

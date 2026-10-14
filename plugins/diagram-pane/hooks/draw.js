@@ -83,7 +83,8 @@ export function parseMermaid(code) {
 
 // `subgraph id`, `subgraph id [Label]`, `subgraph "Label"` or `subgraph Some label`
 function readSubgraph(rest) {
-  const m = rest.match(/^(\w+)\s*\[\s*"?([^\]"]*)"?\s*\]$/)
+  // A quoted label may hold brackets: `subgraph S["arr[0] store"]`
+  const m = rest.match(/^(\w+)\s*\[\s*"([^"]*)"\s*\]$/) || rest.match(/^(\w+)\s*\[\s*([^\]"]*)\s*\]$/)
   if (m) return { id: m[1], label: clean(m[2]) || m[1] }
   const label = clean(rest) || 'group'
   return { id: /^\w+$/.test(rest) ? rest : label.replace(/\W+/g, '_'), label }
@@ -136,8 +137,9 @@ function parseStatement(stmt, nodes, edges, parent) {
       if (!known) nodes.set(n.id, { id: n.id, label: n.label || n.id, box: n.box || 'single', parent })
       else {
         if (n.label && !known.group) Object.assign(known, { label: n.label, box: n.box })
-        // Declared first, linked later: a node moves into a deeper subgraph, never out of one
-        if (parent && known.id !== parent && within(nodes, parent, known.parent)) known.parent = parent
+        // Declared first, linked later: a node moves into a deeper subgraph, never out of one.
+        // A subgraph stays where it was declared: moving it could nest it inside itself.
+        if (parent && !known.group && known.id !== parent && within(nodes, parent, known.parent)) known.parent = parent
       }
       group.push(n.id)
       const amp = rest.match(/^\s*&\s*/)

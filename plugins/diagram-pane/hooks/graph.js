@@ -6,6 +6,7 @@
 //   levelAt(root, path)            -> the graph a path of node ids leads to
 //   setLevel(root, path, level)    -> a copy of root with that level replaced
 //   applyOps(graph, ops)           -> a patched copy, and what changed
+//   uniqueIds(root)                -> a copy where no id appears twice in the tree
 //   toMermaid(graph)               -> flowchart source, details as subgraphs
 
 const KIND_BOX = { file: 'single', component: 'round', step: 'double' }
@@ -78,6 +79,38 @@ export function adoptIds(level, taken, prefix) {
     }
   }
   walk(out)
+  return out
+}
+
+// Mermaid ids are global, so one id may appear only once in the whole tree.
+// Levels are walked top first, so a box on a higher level keeps its id and a
+// clashing one further down gets its parent's id in front.
+export function uniqueIds(root) {
+  const out = clone(root)
+  const taken = new Set()
+  let level = [{ g: out, prefix: null }]
+  while (level.length) {
+    const below = []
+    for (const { g, prefix } of level) {
+      const rename = new Map()
+      for (const n of g.nodes) {
+        if (taken.has(n.id)) {
+          const base = prefix ? `${cleanId(prefix)}_${n.id}` : n.id
+          let id = base
+          for (let i = 2; taken.has(id); i++) id = `${base}${i}`
+          rename.set(n.id, id)
+          n.id = id
+        }
+        taken.add(n.id)
+      }
+      for (const e of g.edges) {
+        e.from = rename.get(e.from) || e.from
+        e.to = rename.get(e.to) || e.to
+      }
+      for (const n of g.nodes) if (n.sub) below.push({ g: n.sub, prefix: n.id })
+    }
+    level = below
+  }
   return out
 }
 

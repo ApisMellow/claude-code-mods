@@ -9,7 +9,7 @@ Claude explains things with mermaid charts, but in a terminal you only see the r
 - **Pinned diagrams.** Whenever a reply has a mermaid code block or an ASCII box diagram, it is pinned in the pane, newest first. Mermaid flowcharts are redrawn as boxes and arrows that fit a 60 column pane.
 - **Live work map.** Every few turns (and on `/diagram`) a cheap Haiku call asks whether the work changed shape. Only on yes does a fork of the session return a small graph of the files, components and steps it is working on, and the pane draws it. The node Claude is on right now is marked `▶`.
 - **Go into a box.** Boxes are numbered. Press a number to open that box's detail: a mermaid `subgraph` opens at once, and any other box gets a detail drawn by a fork of the session. `b` goes back, `t` to the top. A box marked `▸` already has a detail.
-- **Change a diagram.** Type a change into the field under a diagram ("split auth into login and token refresh") and a fork redraws it. Or ask Claude: it reads and edits the pane with two tools, `diagram_get` and `diagram_set`.
+- **Change a diagram.** Press `c` (or Tab to the field) and type a change into the field under a diagram ("split auth into login and token refresh") and a fork redraws it. Or ask Claude: it reads and edits the pane with two tools, `diagram_get` and `diagram_set`.
 - Square boxes are files, round ones components, double ones steps or decisions.
 
 Claude sees the pane only through those two tools.
@@ -59,7 +59,7 @@ The pane opens on its own in a terminal 144 columns or wider. Narrower than that
 ## Limits
 
 - Only mermaid `graph` and `flowchart` charts are redrawn. Sequence, class, state and other types are pinned as raw code. `diagram_set` with mermaid, or a typed change, can turn one into a flowchart.
-- Number keys reach the first nine boxes of a level; Tab reaches the rest.
+- Number keys reach the first nine boxes of a level; Tab or a click reaches the rest. Pinned diagrams on the home view are drawn without numbers: open a pin first to go into its boxes.
 - A fork cannot call tools, so a detail it draws holds only what the session has already seen.
 - Edges between boxes in different subgraphs are drawn to the subgraph's box on the level where both ends show; inside a subgraph, edges that leave it are not shown.
 - Every chart is drawn top to bottom, even `graph LR`, because a narrow pane has no room sideways.
