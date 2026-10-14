@@ -56,20 +56,75 @@ const SHAPES = [
 // Edge operators: an optional label in the middle (-- yes -->) or in pipes (-->|yes|)
 const EDGE_MID = /^\s*(?:<)?(?:--|-\.|==)\s+([^|>]+?)\s+(?:-->|--[ox]|---|\.->|-\.-|==>|===)/
 const EDGE = /^\s*(?:<)?(?:-\.+->|-\.+-|--+>|--+[ox]|---+|==+>|===+|~~~)(?:\|([^|]*)\|)?/
-const SKIP = /^(subgraph|end|classDef|class|style|linkStyle|click|direction|%%|accTitle|accDescr)\b/
+const SKIP = /^(classDef|class|style|linkStyle|click|direction|%%|accTitle|accDescr)\b/
 
+// A subgraph becomes a node whose `sub` is its contents, so the pane shows it
+// as one box and can go into it. Edges that cross a subgraph's border are drawn
+// to the subgraph's box on the level where both ends are visible.
 export function parseMermaid(code) {
   const stmts = code.split(/[\n;]/).map(l => l.trim()).filter(Boolean)
   if (!/^(graph|flowchart)\b/i.test(stmts[0] || '')) return null
   const nodes = new Map()
   const edges = []
-  for (const stmt of stmts.slice(1)) if (!SKIP.test(stmt)) parseStatement(stmt, nodes, edges)
+  const stack = []
+  for (const stmt of stmts.slice(1)) {
+    if (/^subgraph\b/.test(stmt)) {
+      const g = readSubgraph(stmt.slice(8).trim())
+      const known = nodes.get(g.id)
+      if (known) Object.assign(known, { label: g.label, box: 'round', group: true, parent: stack.at(-1) ?? null })
+      else nodes.set(g.id, { id: g.id, label: g.label, box: 'round', group: true, parent: stack.at(-1) ?? null })
+      stack.push(g.id)
+    } else if (/^end$/.test(stmt)) stack.pop()
+    else if (!SKIP.test(stmt)) parseStatement(stmt, nodes, edges, stack.at(-1) ?? null)
+  }
   if (!nodes.size) return null
-  return { nodes: [...nodes.values()], edges }
+  return nest(nodes, edges, null)
 }
 
-// A statement is: group (edge group)*, where a group is node (& node)*
-function parseStatement(stmt, nodes, edges) {
+// `subgraph id`, `subgraph id [Label]`, `subgraph "Label"` or `subgraph Some label`
+function readSubgraph(rest) {
+  // A quoted label may hold brackets: `subgraph S["arr[0] store"]`
+  const m = rest.match(/^(\w+)\s*\[\s*"([^"]*)"\s*\]$/) || rest.match(/^(\w+)\s*\[\s*([^\]"]*)\s*\]$/)
+  if (m) return { id: m[1], label: clean(m[2]) || m[1] }
+  const label = clean(rest) || 'group'
+  return { id: /^\w+$/.test(rest) ? rest : label.replace(/\W+/g, '_'), label }
+}
+
+// The level of the tree under `parent`: its own nodes, and the edges between them
+// after lifting each end to the ancestor that sits on this level
+function nest(flat, edges, parent) {
+  const parentOf = id => flat.get(id)?.parent ?? null
+  const onLevel = id => {
+    let cur = id
+    for (let hops = 0; cur != null && parentOf(cur) !== parent && hops < 50; hops++) cur = parentOf(cur)
+    return cur != null && parentOf(cur) === parent ? cur : null
+  }
+  const nodes = []
+  for (const n of flat.values()) {
+    if ((n.parent ?? null) !== parent) continue
+    const node = { id: n.id, label: n.label, box: n.box }
+    if (n.group) {
+      const sub = nest(flat, edges, n.id)
+      if (sub.nodes.length) node.sub = sub
+    }
+    nodes.push(node)
+  }
+  const out = []
+  const seen = new Set()
+  for (const e of edges) {
+    const from = onLevel(e.from), to = onLevel(e.to)
+    if (!from || !to || from === to) continue
+    const key = `${from}>${to}>${e.label}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ from, to, label: e.label })
+  }
+  return { nodes, edges: out }
+}
+
+// A statement is: group (edge group)*, where a group is node (& node)*.
+// A node mentioned inside a subgraph belongs to it, as in mermaid.
+function parseStatement(stmt, nodes, edges, parent) {
   let rest = stmt
   let prev = null
   while (rest.trim()) {
@@ -79,8 +134,13 @@ function parseStatement(stmt, nodes, edges) {
       if (!n) return
       rest = n.rest
       const known = nodes.get(n.id)
-      if (!known) nodes.set(n.id, { id: n.id, label: n.label || n.id, box: n.box || 'single' })
-      else if (n.label) Object.assign(known, { label: n.label, box: n.box })
+      if (!known) nodes.set(n.id, { id: n.id, label: n.label || n.id, box: n.box || 'single', parent })
+      else {
+        if (n.label && !known.group) Object.assign(known, { label: n.label, box: n.box })
+        // Declared first, linked later: a node moves into a deeper subgraph, never out of one.
+        // A subgraph stays where it was declared: moving it could nest it inside itself.
+        if (parent && !known.group && known.id !== parent && within(nodes, parent, known.parent)) known.parent = parent
+      }
       group.push(n.id)
       const amp = rest.match(/^\s*&\s*/)
       if (!amp) break
@@ -92,6 +152,15 @@ function parseStatement(stmt, nodes, edges) {
     prev = { ids: group, label: clean(e[1] || '') }
     rest = rest.slice(e[0].length)
   }
+}
+
+// Is subgraph `inner` inside `outer` (or is `outer` the top level)?
+function within(nodes, inner, outer) {
+  if (outer == null) return true
+  for (let cur = nodes.get(inner)?.parent, hops = 0; cur != null && hops < 50; cur = nodes.get(cur)?.parent, hops++) {
+    if (cur === outer) return true
+  }
+  return false
 }
 
 function readNode(text) {
