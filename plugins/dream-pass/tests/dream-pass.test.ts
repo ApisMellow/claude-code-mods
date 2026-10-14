@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import {
-  aliveArgv, conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parentDir, parsePlan, redirectLinks, removeArgv, renameArgv,
+  aliveArgv, conversationSince, dropDeadPointers, indexProblems, isWindowsPath, keywords, originIds, parentDir, parsePlan, redirectLinks, removeArgv, renameArgv,
   safeName, snippets, summary, suspects, userRows,
 } from '../hooks/register.js'
 
@@ -130,4 +130,11 @@ test('where rm, mv and kill are missing, node deletes, renames and checks livene
   const alive = aliveArgv(4242)
   expect([alive[0], alive[1], alive[3]]).toEqual(['node', '-e', '4242'])
   expect(alive[2]).toMatch(/process\.kill\(/)
+})
+
+test('a memory folder on a drive or a share is a Windows path, so liveness skips MSYS kill', async () => {
+  expect(isWindowsPath('C:\\Users\\User\\.claude\\projects\\p\\memory')).toBe(true)
+  expect(isWindowsPath('c:/Users/User/.claude/projects/p/memory')).toBe(true)
+  expect(isWindowsPath('\\\\server\\share\\memory')).toBe(true)
+  expect(isWindowsPath('/home/u/.claude/projects/p/memory')).toBe(false)
 })

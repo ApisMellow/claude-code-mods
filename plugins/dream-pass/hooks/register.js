@@ -493,7 +493,10 @@ async function autoDreamRunning($, dir) {
     const lock = dir + '/.consolidate-lock'
     if (Date.now() - (await $.fs.stat(lock)).mtimeMs > 3600000) return false
     const pid = parseInt((await $.fs.read(lock)).trim(), 10)
-    return pid > 0 && (await runPortable($, ['kill', '-0', String(pid)], aliveArgv(pid))).exitCode === 0
+    if (!(pid > 0)) return false
+    // On Windows a `kill` on PATH is Git's MSYS one, which does not know Windows PIDs, so ask node
+    const alive = isWindowsPath(dir) ? await $.process.run(aliveArgv(pid)) : await runPortable($, ['kill', '-0', String(pid)], aliveArgv(pid))
+    return alive.exitCode === 0
   } catch {
     return false
   }
@@ -529,6 +532,11 @@ async function readMemory($, dir, dates = {}) {
 // The folder a path is in, whichever separator it uses
 export function parentDir(path) {
   return path.replace(/[\\/][^\\/]+$/, '')
+}
+
+// C:\x, C:/x or \\server\share
+export function isWindowsPath(path) {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
 }
 
 // The rows of a transcript that came from the user (what `grep '"type": ?"user"'` found)
