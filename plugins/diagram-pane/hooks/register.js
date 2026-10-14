@@ -744,7 +744,7 @@ function paneItems(w, act) {
   const input = placeholder => {
     out.push({ buttons: [{ key: 'change', hotkey: 'c', label: 'type a change', onPress: () => act?.typeChange() }] })
     out.push({ input: { key: inputKey(), placeholder, submitLabel: 'change', onSubmit: value => act?.edit(value) } })
-    add('keys work once the pane has focus: click it, ctrl+x tab, or /diagram open', { dim: true })
+    add('keys: click the pane, ctrl+x tab or /diagram open', { dim: true })
   }
 
   // Inside a box, or a pin opened on its own: that one diagram
