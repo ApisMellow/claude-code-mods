@@ -51,9 +51,8 @@ async function loadConfig($, options) {
 // it wrote to (ephemeral_1h or ephemeral_5m). Read the newest main-thread one.
 async function readTtl($) {
   if (!transcript || cfg.pinned) return
-  const { stdout } = await $.process.run(['tail', '-n', '300', transcript])
-  const rows = stdout.split('\n').reverse()
-  for (const row of rows) {
+  const text = await $.fs.read(transcript).catch(() => '')
+  for (const row of lastLines(text, 300).reverse()) {
     if (!row.includes('"cache_creation"')) continue
     let msg
     try { msg = JSON.parse(row) } catch { continue }
@@ -63,6 +62,14 @@ async function readTtl($) {
     if (cc.ephemeral_5m_input_tokens > 0) { cfg.mainTtl = 5 * MIN; ttlSource = 'measured'; return }
     // a pure cache read does not say which bucket; look further back
   }
+}
+
+// The last n lines of a file's text, CRLF or LF. It used to be `tail -n`,
+// which a native Windows terminal does not have.
+export function lastLines(text, n) {
+  const lines = String(text).split(/\r?\n/)
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines.slice(-n)
 }
 
 // 47:05 or 3:09
@@ -108,7 +115,7 @@ const HANDOFF_MARKER = 'cache-clock handoff'
 // each other's. It goes to CACHE_CLOCK_HANDOFF_DIR, else the project root
 // (not the shell's current folder, which a `cd` can move into a nested repo).
 export function handoffPath(dir, sessionId) {
-  return dir.replace(/\/+$/, '') + '/HANDOFF-' + String(sessionId).slice(0, 8) + '.md'
+  return dir.replace(/[\\/]+$/, '') + '/HANDOFF-' + String(sessionId).slice(0, 8) + '.md'
 }
 function handoffText(file) {
   return '(' + HANDOFF_MARKER + ') The prompt cache goes cold soon and the user has not replied. While the cache is still warm, write a short handoff note to ' + file + ': the goal, what is done, what is next, open questions, and the key files. Keep it brief, and write it even if the session has been short. Do nothing else. A fresh session will start from it if the user does not come back.'
@@ -142,7 +149,7 @@ async function tick($) {
       if (cfg.onWarning === 'compact') compactWarm($, s.left)
       else {
         const file = handoffPath(cfg.handoffDir || (await $.session.root()), await $.session.id())
-        $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. No reply, so Claude is writing ' + file.split('/').pop() + ' while it is warm.', { timeoutMs: 10_000 })
+        $.ui.toast('Prompt cache goes cold in ' + clock(s.left) + '. No reply, so Claude is writing ' + file.split(/[\\/]/).pop() + ' while it is warm.', { timeoutMs: 10_000 })
         $.prompt.submit({ text: handoffText(file) }).catch(() => {}) // waits for idle; don't await in the tick
       }
     } else {

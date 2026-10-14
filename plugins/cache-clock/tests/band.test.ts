@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { handoffPath, pickAction } from '../hooks/register'
+import { handoffPath, lastLines, pickAction } from '../hooks/register'
 
 test('the band draws one line', async ($, on) => {
   on('clock.now', () => ({ value: 1_000_000 }))
@@ -20,4 +20,15 @@ test('the warning action comes from the env var, then the old switch, then the s
 test('each session gets its own handoff note', async () => {
   expect(handoffPath('/w/proj', '1a2b3c4d-5e6f-7a8b-9c0d-ef0123456789')).toBe('/w/proj/HANDOFF-1a2b3c4d.md')
   expect(handoffPath('/w/notes/', '9f8e7d6c-0000')).toBe('/w/notes/HANDOFF-9f8e7d6c.md')
+})
+
+test('a Windows handoff folder with a trailing backslash gets one separator', async () => {
+  expect(handoffPath('C:\\proj\\', '1a2b3c4d-0000')).toBe('C:\\proj/HANDOFF-1a2b3c4d.md')
+})
+
+test('lastLines takes the end of LF and CRLF text, like tail -n', async () => {
+  expect(lastLines('a\nb\nc\n', 2)).toEqual(['b', 'c'])
+  expect(lastLines('a\r\nb\r\nc\r\n', 2)).toEqual(['b', 'c'])
+  expect(lastLines('a\nb', 5)).toEqual(['a', 'b'])
+  expect(lastLines('', 3)).toEqual([])
 })
