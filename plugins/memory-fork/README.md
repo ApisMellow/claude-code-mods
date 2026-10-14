@@ -8,7 +8,7 @@ After every turn:
 
 1. **Haiku judges the turn.** It reads the last exchange and your `MEMORY.md` index and answers `SKIP` or `UPDATE: <what to save>`.
 2. **A fork drafts the change.** `$.model.fork` replays the session's own transcript (served from the prompt cache) with the current memory files attached. Every tool is denied; it can only reply with JSON: `{"write": [{"name", "content"}], "delete": [...]}`.
-3. **The mod writes it.** The files are written with `$.fs.write` and deletions run as `rm -f`, only for bare `*.md` names inside the project's memory folder. `MEMORY.md` is never deleted.
+3. **The mod writes it.** The files are written with `$.fs.write` and deletions run as a shell-free `node -e` `fs.rmSync` (so they work on Windows too), only for bare `*.md` names inside the project's memory folder. `MEMORY.md` is never deleted.
 
 A band above the prompt shows the run (`Memory: updating …`, then the lines added and removed and the files changed, as in `Memory: +13 −13 · db-p99-under-10ms.md, MEMORY.md`) with **Open** and **Hide** buttons. **Open** shows a pane listing every run this session, each file with its own `+added −removed` count, and the session total at the top. `/memory-fork` opens the same pane.
 

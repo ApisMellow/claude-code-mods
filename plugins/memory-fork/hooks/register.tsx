@@ -48,10 +48,28 @@ export const parseOps = (text: string) => {
 }
 
 const memoryDir = async ($: EngineInterface) => {
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${await $.env.get('HOME')}/.claude`
+  // A native Windows terminal sets USERPROFILE, not HOME
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`
   const slug = (await $.session.cwd()).replace(/[^A-Za-z0-9]/g, '-')
 
   return `${config}/projects/${slug}/memory`
+}
+
+// Windows has no rm, and $.fs has no remove, so node deletes the files, with the paths as arguments: no shell, no quoting.
+export const removeArgv = (paths: string[]) => [
+  'node',
+  '-e',
+  'for (const p of process.argv.slice(1)) require("fs").rmSync(p, { force: true })',
+  ...paths,
+]
+
+// Whether path is inside dir, with / or \ as the separator. Windows paths are compared without case.
+export const isInside = (path: string, dir: string) => {
+  const windows = /^[A-Za-z]:[\\/]/.test(dir)
+  const norm = (p: string) => (windows ? p.replace(/\\/g, '/').toLowerCase() : p)
+
+  return norm(path).startsWith(`${norm(dir)}/`)
 }
 
 const memoryFiles = async ($: EngineInterface, dir: string): Promise<FsEntry[]> =>
@@ -165,7 +183,7 @@ async function write($: EngineInterface) {
     return setRun($, id, { status: 'failed', reason: 'fork did not answer with JSON' })
   }
   for (const one of ops.write) await $.fs.write(`${dir}/${one.name}`, one.content)
-  if (ops.delete.length > 0) await $.process.run(['rm', '-f', ...ops.delete.map(name => `${dir}/${name}`)])
+  if (ops.delete.length > 0) await $.process.run(removeArgv(ops.delete.map(name => `${dir}/${name}`)))
 
   await setRun($, id, { status: 'done', changes: diff(before, await readMemory($, dir)) })
 }
@@ -204,7 +222,7 @@ export const register: Register = on => {
     if (e.agentId !== undefined) return next(e)
     const dir = await memoryDir($)
 
-    return e.file_path.startsWith(`${dir}/`)
+    return isInside(e.file_path, dir)
       ? { deny: 'memory-fork: memory is written by the background fork at the end of the turn, not by the main session.' }
       : next(e)
   }).catch(($, e, next) => next(e))

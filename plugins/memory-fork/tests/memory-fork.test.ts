@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { diff, lastExchange, lineDiff, parseOps, totals } from '../hooks/register'
+import { diff, isInside, lastExchange, lineDiff, parseOps, removeArgv, totals } from '../hooks/register'
 
 test('diff names added, updated and deleted memories with their line counts', async () => {
   const before = new Map([['a.md', 'one\ntwo\n'], ['b.md', 'one\ntwo\nthree\n'], ['c.md', 'gone\nalso gone\n']])
@@ -49,4 +49,32 @@ test('parseOps keeps bare memory names and never deletes the index', async () =>
   const ops = parseOps(`Here: {"write": [{"name": "a.md", "content": "x"}, {"name": "../evil.md", "content": "x"}, {"name": "b.txt", "content": "x"}], "delete": ["MEMORY.md", "c.md", "/etc/d.md"]}`)
 
   expect(ops).toEqual({ write: [{ name: 'a.md', content: 'x' }], delete: ['c.md'] })
+})
+
+test('on Windows the memory folder comes from USERPROFILE, and a backslash path is still blocked', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:\\Users\\User' })
+  on('session.cwd', () => ({ value: 'C:\\proj' }))
+  on('tool.call', () => ({ result: 'written' }) as never)
+
+  const blocked = await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\User\\.claude\\projects\\C--proj\\memory\\x.md', content: 'x' })
+  const allowed = await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\x.md', content: 'x' })
+
+  expect(blocked.deny ?? blocked.text).toContain('memory-fork')
+  expect(allowed.deny).toBeUndefined()
+})
+
+test('isInside takes / or \\ on Windows, and only / elsewhere', async () => {
+  const win = 'C:\\Users\\User/.claude/projects/C--proj/memory'
+  expect(isInside('C:\\Users\\User\\.claude\\projects\\C--proj\\memory\\a.md', win)).toBe(true)
+  expect(isInside('c:/users/user/.claude/projects/C--proj/memory/a.md', win)).toBe(true)
+  expect(isInside('C:\\Users\\User\\.claude\\projects\\C--proj\\memory-old\\a.md', win)).toBe(false)
+  expect(isInside('/home/r/.claude/projects/-w/memory/a.md', '/home/r/.claude/projects/-w/memory')).toBe(true)
+  expect(isInside('/home/r/.claude/projects/-w/memoryx/a.md', '/home/r/.claude/projects/-w/memory')).toBe(false)
+})
+
+test('deletes run node with the paths as arguments, not rm', async () => {
+  const argv = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
+  expect(argv.slice(0, 2)).toEqual(['node', '-e'])
+  expect(argv.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])
+  expect(argv[2]).toMatch(/rmSync/)
 })
