@@ -119,7 +119,7 @@ test('userRows keeps the user rows of a transcript, LF or CRLF, with no grep', a
   expect(userRows('')).toEqual([])
 })
 
-test('delete, rename and the liveness check run node with the paths as arguments, never rm, mv or kill', async () => {
+test('where rm, mv and kill are missing, node deletes, renames and checks liveness with the paths as arguments', async () => {
   const rm = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
   expect(rm.slice(0, 2)).toEqual(['node', '-e'])
   expect(rm.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])

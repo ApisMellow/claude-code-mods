@@ -72,7 +72,7 @@ test('isInside takes / or \\ on Windows, and only / elsewhere', async () => {
   expect(isInside('/home/r/.claude/projects/-w/memoryx/a.md', '/home/r/.claude/projects/-w/memory')).toBe(false)
 })
 
-test('deletes run node with the paths as arguments, not rm', async () => {
+test('where rm is missing, node deletes with the paths as arguments', async () => {
   const argv = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
   expect(argv.slice(0, 2)).toEqual(['node', '-e'])
   expect(argv.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])

@@ -56,7 +56,7 @@ const memoryDir = async ($: EngineInterface) => {
   return `${config}/projects/${slug}/memory`
 }
 
-// Windows has no rm, and $.fs has no remove, so node deletes the files, with the paths as arguments: no shell, no quoting.
+// $.fs has no remove, so where there is no rm node deletes the files, with the paths as arguments: no shell, no quoting.
 export const removeArgv = (paths: string[]) => [
   'node',
   '-e',
@@ -183,7 +183,11 @@ async function write($: EngineInterface) {
     return setRun($, id, { status: 'failed', reason: 'fork did not answer with JSON' })
   }
   for (const one of ops.write) await $.fs.write(`${dir}/${one.name}`, one.content)
-  if (ops.delete.length > 0) await $.process.run(removeArgv(ops.delete.map(name => `${dir}/${name}`)))
+  if (ops.delete.length > 0) {
+    const paths = ops.delete.map(name => `${dir}/${name}`)
+    // A native Windows terminal has no rm: $.process.run throws ENOENT, so node deletes them instead
+    await $.process.run(['rm', '-f', ...paths]).catch(() => $.process.run(removeArgv(paths)))
+  }
 
   await setRun($, id, { status: 'done', changes: diff(before, await readMemory($, dir)) })
 }

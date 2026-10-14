@@ -359,7 +359,8 @@ async function undo($, options) {
   await removeFiles($, Object.keys(await readMemory($, dir)).filter((name) => !(name in saved)).map((name) => dir + '/' + name))
   for (const [name, text] of Object.entries(saved)) await $.fs.write(dir + '/' + name, text)
   // Retire the used backup, so a second undo goes one dream further back
-  await $.process.run(renameArgv(root + '/' + stamp, root + '/undone-' + stamp))
+  const [from, to] = [root + '/' + stamp, root + '/undone-' + stamp]
+  await runPortable($, ['mv', from, to], renameArgv(from, to))
   const run = S.runs.findLast((r) => r.stamp === stamp)
   if (run) finish($, run, { status: 'undone', note: 'restored the backup from ' + stamp })
   else addRun($, { why: 'undo', status: 'undone', note: 'restored the backup from ' + stamp })
@@ -492,7 +493,7 @@ async function autoDreamRunning($, dir) {
     const lock = dir + '/.consolidate-lock'
     if (Date.now() - (await $.fs.stat(lock)).mtimeMs > 3600000) return false
     const pid = parseInt((await $.fs.read(lock)).trim(), 10)
-    return pid > 0 && (await $.process.run(aliveArgv(pid))).exitCode === 0
+    return pid > 0 && (await runPortable($, ['kill', '-0', String(pid)], aliveArgv(pid))).exitCode === 0
   } catch {
     return false
   }
@@ -535,8 +536,16 @@ export function userRows(text) {
   return text.split(/\r?\n/).filter((row) => /"type": ?"user"/.test(row))
 }
 
-// A native Windows terminal has no rm, mv or kill, and $.fs has no remove or
-// rename, so these run node with the paths as arguments: no shell, no quoting.
+// A native Windows terminal has no rm, mv or kill: $.process.run throws
+// ENOENT before it starts. $.fs has no remove or rename either, so then node
+// does the same job, with the paths as arguments: no shell, no quoting.
+async function runPortable($, unix, viaNode) {
+  try {
+    return await $.process.run(unix)
+  } catch {
+    return await $.process.run(viaNode)
+  }
+}
 export function removeArgv(paths) {
   return ['node', '-e', 'for (const p of process.argv.slice(1)) require("fs").rmSync(p, { force: true })', ...paths]
 }
@@ -548,7 +557,7 @@ export function aliveArgv(pid) {
   return ['node', '-e', 'process.kill(Number(process.argv[1]), 0)', String(pid)]
 }
 async function removeFiles($, paths) {
-  if (paths.length) await $.process.run(removeArgv(paths))
+  if (paths.length) await runPortable($, ['rm', '-f', ...paths], removeArgv(paths))
 }
 
 // Memories, not counting the index
