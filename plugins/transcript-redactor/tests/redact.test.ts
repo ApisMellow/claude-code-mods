@@ -237,15 +237,18 @@ test('R25 a deny from beneath that quotes the restored input is scrubbed', async
   expect(String(r.deny)).toContain(tag)
 })
 
-// fs as core answers it: a read past 4 MiB rejects.
+// fs as core answers it: a read past 4 MiB rejects. On Windows core hands
+// the mock the path resolved (C:\repo\big.log), so files are looked up by the
+// path with its drive taken off and its separators made /.
+const unixPath = (path: string) => String(path).replace(/^[A-Za-z]:/, '').replace(/\\/g, '/')
 function fsWith(on: any, files: Record<string, { size: number; text: string }>) {
   on('fs.read', (_$: unknown, e: any) => {
-    const f = files[e.path]
+    const f = files[unixPath(e.path)]
     if (!f) throw new Error('ENOENT')
     if (f.size > 4 * 1024 * 1024) throw new Error('over 4 MiB')
     return { value: f.text }
   })
-  on('fs.exists', (_$: unknown, e: any) => ({ value: e.path in files }))
+  on('fs.exists', (_$: unknown, e: any) => ({ value: unixPath(e.path) in files }))
 }
 
 for (const path of ['/repo/shot.png', '/repo/paper.pdf']) {
@@ -261,6 +264,11 @@ for (const path of ['/repo/shot.png', '/repo/paper.pdf']) {
     expect(reached).toBe(true)
   })
 }
+
+test('R26 the fs mock finds a file by its Windows path too', async () => {
+  expect(unixPath('C:\\repo\\big.log')).toBe('/repo/big.log')
+  expect(unixPath('/repo/big.log')).toBe('/repo/big.log')
+})
 
 test('R26 an @-mentioned text file too large to read is still refused', async ($, on) => {
   fsWith(on, { '/repo/big.log': { size: 12 * 1024 * 1024, text: '' } })
