@@ -2,7 +2,7 @@
 
 A Claude Code mod that opens a side pane with a live picture of the work: every diagram Claude draws, pinned and readable, and a small map of what Claude is doing right now.
 
-![diagram-pane: Claude adds a discount module on the left; on the right the live work map shows checkout.js fanning out to cart.js, discounts.js and the pay callback, with the pinned call flow below](screenshot.png)
+![diagram-pane: Claude adds a discount module on the left; on the right the pane has gone into the checkout.js box, its numbered steps drawn as boxes, with a change being typed into the field below](screenshot.png)
 
 Claude explains things with mermaid charts, but in a terminal you only see the raw code, and it scrolls away. Meanwhile the shape of the work (which files, which steps, what connects to what) lives only in Claude's context. This pane shows you both.
 
@@ -17,6 +17,8 @@ Claude sees the pane only through those two tools.
 ![A mermaid chart in Claude's reply on the left, the same chart drawn as boxes and arrows in the pane on the right](images/pinned.png)
 
 ![A plain question: the Haiku gate says the work kept its shape, so the map stays and no fork runs](images/gate.png)
+
+![Claude is asked to add a receipt step: it calls diagram_get and diagram_set, and the map in the pane gains the step and is marked edited](images/tools.png)
 
 ## Install
 
