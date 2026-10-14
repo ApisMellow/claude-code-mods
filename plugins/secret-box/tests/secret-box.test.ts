@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { isAbsolute, isEnvFile } from '../hooks/register'
+
 // Fake keys, built at run time so no key-shaped string sits in the repo
 const STRIPE = 'sk_' + 'live_' + 'A1b2C3d4E5f6G7h8J9k0L1m2'
 const WEAK = 'hunter' + '2hunter2' // a short password the detector alone would miss
@@ -158,4 +160,28 @@ test('git -C checks the repository it names', async ($, on) => {
 test('a commit is blocked when git cannot say what it includes', async ($, on) => {
   gitStub(on, { fails: true })
   expect(Boolean((await call($, { tool: 'Bash', command: 'git commit -m wip' })).deny)).toBe(true)
+})
+
+test('a Windows .env path is read where it is, and its weak values are hidden', async ($, on) => {
+  const plain = 'staple' + 'gunwindow' // letters only: no detector rule fires on it
+  const looked: string[] = []
+  stubs(on, { output: `PORT=3000\nADMIN_PASS=${plain}\n`, dotenv: `ADMIN_PASS=${plain}\n` })
+  on('session.cwd', () => ({ value: 'C:\\repo' }))
+  on('fs.exists', (_$: unknown, e: { path: string }) => { looked.push(e.path); return { value: true } })
+  const out = String((await call($, { tool: 'Read', file_path: 'C:\\repo\\.env' })).result)
+  expect(looked).toContain('C:\\repo\\.env')
+  expect(out).not.toContain(plain)
+  expect(out).toContain('PORT=3000')
+})
+
+test('isEnvFile takes the name after a / or a \\', async () => {
+  expect(isEnvFile('C:\\repo\\.env.local')).toBe(true)
+  expect(isEnvFile('/repo/.env')).toBe(true)
+  expect(isEnvFile('C:\\repo\\.env.example')).toBe(false)
+  expect(isEnvFile('C:\\repo\\app.env')).toBe(false)
+})
+
+test('isAbsolute knows Unix, drive-letter and UNC paths', async () => {
+  for (const p of ['/repo/.env', 'C:\\repo\\.env', 'd:/repo/.env', '\\\\server\\share\\.env']) expect(isAbsolute(p)).toBe(true)
+  for (const p of ['.env', 'config\\.env', 'C:.env', '~/.env']) expect(isAbsolute(p)).toBe(false)
 })

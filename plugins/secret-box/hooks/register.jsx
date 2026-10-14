@@ -75,7 +75,7 @@ export function register(on, options) {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secret-box: could not check this .env file, so the call is blocked to be safe.' }))
 
   // @.env would attach the raw file to your prompt
-  on('prompt.mention', { path: /(^|\/)\.env(\.[\w.-]+)?$/ }, async ($, e, next) =>
+  on('prompt.mention', { path: /(^|[\\/])\.env(\.[\w.-]+)?$/ }, async ($, e, next) =>
     isEnvFile(e.path) ? { deny: 'secret-box: ask Claude to read .env instead; its secrets come back hidden' } : next(e))
     .catch(() => ({ deny: 'secret-box: the .env guard failed' }))
 
@@ -106,7 +106,7 @@ export function register(on, options) {
     // is not counted, so wait for the person in short `sleep` processes.
     const deadline = (await $.clock.now()) + 10 * 60_000
     while (pending.answer === undefined && !next.signal.aborted && (await $.clock.now()) < deadline) {
-      await $.process.run(['sleep', '0.3'])
+      await pause($)
     }
     const value = pending.answer
     pending = null
@@ -123,9 +123,11 @@ export function register(on, options) {
     } catch (err) {
       return { result: `Saving ${name} failed: ${String(err && err.message || err).slice(0, 300)}` }
     }
-  }).catch(($, e, next) => {
-    // If the hook itself fails (or times out), drop the request and tell Claude plainly
+  }).catch(async ($, e, next) => {
+    // If the hook itself fails (or times out), drop the request, close the box and tell Claude plainly
     pending = null
+    try { await $.ui.close({ id: PANE }) } catch {}
+    $.ui.invalidate('ui.render')
     $.ui.log('request_secret failed: ' + JSON.stringify(next.error).slice(0, 500))
     return { result: 'secret-box failed before anything was saved. Nothing was written.' }
   })
@@ -147,9 +149,25 @@ export function register(on, options) {
   }).catch(($, e, next) => next(e))
 }
 
+// One short wait. A native Windows terminal has no `sleep` ($.process.run
+// throws ENOENT), so after the first miss node waits instead.
+const SLEEP = ['sleep', '0.3']
+const NODE_SLEEP = ['node', '-e', 'setTimeout(() => {}, 300)']
+let hasSleep = true
+async function pause($) {
+  if (hasSleep) {
+    try {
+      return await $.process.run(SLEEP)
+    } catch {
+      hasSleep = false
+    }
+  }
+  await $.process.run(NODE_SLEEP)
+}
+
 // .env, .env.local, .env.production ... but not .env.example and friends
-function isEnvFile(path) {
-  const base = String(path || '').split('/').pop()
+export function isEnvFile(path) {
+  const base = String(path || '').split(/[\\/]/).pop()
   return /^\.env(\.[\w.-]+)?$/.test(base) && !/\.(example|sample|template|dist)$/.test(base)
 }
 
@@ -168,7 +186,7 @@ async function learnDotenv($, files) {
   try { cwd = await $.session.cwd() } catch {}
   for (const f of files) {
     try {
-      const path = f.startsWith('/') ? f : f.startsWith('~/') ? f : cwd + '/' + f
+      const path = isAbsolute(f) ? f : f.startsWith('~/') ? f : cwd + '/' + f
       if (path.startsWith('~/') || !(await $.fs.exists(path))) continue
       for (const m of (await $.fs.read(path)).matchAll(ASSIGNMENT)) {
         const value = m[3].trim().replace(/^["']|["']$/g, '')
@@ -176,6 +194,11 @@ async function learnDotenv($, files) {
       }
     } catch {}
   }
+}
+
+// /x on Mac and Linux; C:\x, C:/x or \\server\share on Windows
+export function isAbsolute(path) {
+  return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
 }
 
 // The repositories a command's git calls run in: each `git -C <dir>`, and the
