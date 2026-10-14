@@ -297,7 +297,7 @@ async function apply($, dir, files, plan, stamp, why) {
   for (const m of plan.merged) {
     await $.fs.write(dir + '/' + m.into, m.content)
     for (const from of m.from) {
-      await $.process.run(['rm', '-f', dir + '/' + from])
+      await removeFiles($, [dir + '/' + from])
       changes.push({ kind: 'merged', file: from, why: 'merged into ' + m.into })
     }
   }
@@ -306,7 +306,7 @@ async function apply($, dir, files, plan, stamp, why) {
     changes.push({ kind: 'rewritten', file: w.file, why: w.why || '' })
   }
   for (const d of plan.removed) {
-    await $.process.run(['rm', '-f', dir + '/' + d.file])
+    await removeFiles($, [dir + '/' + d.file])
     changes.push({ kind: 'removed', file: d.file, why: d.why || '' })
   }
   for (const a of plan.added) {
@@ -356,12 +356,10 @@ async function undo($, options) {
   const stamp = stamps[stamps.length - 1]
   const saved = await readMemory($, root + '/' + stamp)
   delete saved['DREAM.md']
-  for (const name of Object.keys(await readMemory($, dir))) {
-    if (!(name in saved)) await $.process.run(['rm', '-f', dir + '/' + name])
-  }
+  await removeFiles($, Object.keys(await readMemory($, dir)).filter((name) => !(name in saved)).map((name) => dir + '/' + name))
   for (const [name, text] of Object.entries(saved)) await $.fs.write(dir + '/' + name, text)
   // Retire the used backup, so a second undo goes one dream further back
-  await $.process.run(['mv', root + '/' + stamp, root + '/undone-' + stamp])
+  await $.process.run(renameArgv(root + '/' + stamp, root + '/undone-' + stamp))
   const run = S.runs.findLast((r) => r.stamp === stamp)
   if (run) finish($, run, { status: 'undone', note: 'restored the backup from ' + stamp })
   else addRun($, { why: 'undo', status: 'undone', note: 'restored the backup from ' + stamp })
@@ -409,7 +407,7 @@ async function gatherEvidence($, dir, files, sid) {
 // Transcripts sit beside the memory folder: projects/<project>/<session>.jsonl
 async function transcriptsDir($, dir) {
   const set = await $.env.get('DREAM_PASS_TRANSCRIPTS_DIR')
-  for (const d of [set, dir.replace(/\/[^/]+$/, '')]) {
+  for (const d of [set, parentDir(dir)]) {
     if (!d || !(await $.fs.exists(d))) continue
     if ((await $.fs.list(d)).some((e) => e.name.endsWith('.jsonl'))) return d
   }
@@ -418,10 +416,9 @@ async function transcriptsDir($, dir) {
 
 // What the user typed in one session (not tool results, not slash command plumbing)
 async function sessionText($, path) {
-  const r = await $.process.run(['grep', '-E', '"type": ?"user"', path])
   const lines = []
   let date = '?'
-  for (const raw of r.stdout.split('\n')) {
+  for (const raw of userRows(await $.fs.read(path).catch(() => ''))) {
     let o
     try { o = JSON.parse(raw) } catch { continue }
     if (o.isMeta || !o.message) continue
@@ -495,7 +492,7 @@ async function autoDreamRunning($, dir) {
     const lock = dir + '/.consolidate-lock'
     if (Date.now() - (await $.fs.stat(lock)).mtimeMs > 3600000) return false
     const pid = parseInt((await $.fs.read(lock)).trim(), 10)
-    return pid > 0 && (await $.process.run(['kill', '-0', String(pid)])).exitCode === 0
+    return pid > 0 && (await $.process.run(aliveArgv(pid))).exitCode === 0
   } catch {
     return false
   }
@@ -506,9 +503,10 @@ async function autoDreamRunning($, dir) {
 // Where the memory lives: the memoryDir option, DREAM_PASS_MEMORY_DIR, the
 // autoMemoryDirectory setting, else Claude Code's own folder for the git root
 async function memoryDir($, options) {
-  const home = await $.env.get('HOME')
+  // A native Windows terminal sets USERPROFILE, not HOME
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
   const set = options?.memoryDir || (await $.env.get('DREAM_PASS_MEMORY_DIR')) || (await $.settings.read()).autoMemoryDirectory
-  if (set) return set.replace(/^~(?=\/)/, home).replace(/\/$/, '')
+  if (set) return set.replace(/^~(?=[\\/])/, home).replace(/[\\/]$/, '')
   const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || home + '/.claude'
   const repo = await $.session.repo()
   const root = repo ? repo.root : await $.session.cwd()
@@ -525,6 +523,32 @@ async function readMemory($, dir, dates = {}) {
     dates[entry.name] = new Date(entry.mtimeMs).toISOString().slice(0, 10)
   }
   return files
+}
+
+// The folder a path is in, whichever separator it uses
+export function parentDir(path) {
+  return path.replace(/[\\/][^\\/]+$/, '')
+}
+
+// The rows of a transcript that came from the user (what `grep '"type": ?"user"'` found)
+export function userRows(text) {
+  return text.split(/\r?\n/).filter((row) => /"type": ?"user"/.test(row))
+}
+
+// A native Windows terminal has no rm, mv or kill, and $.fs has no remove or
+// rename, so these run node with the paths as arguments: no shell, no quoting.
+export function removeArgv(paths) {
+  return ['node', '-e', 'for (const p of process.argv.slice(1)) require("fs").rmSync(p, { force: true })', ...paths]
+}
+export function renameArgv(from, to) {
+  return ['node', '-e', 'require("fs").renameSync(process.argv[1], process.argv[2])', from, to]
+}
+// Exits 0 while the process is alive, like `kill -0`
+export function aliveArgv(pid) {
+  return ['node', '-e', 'process.kill(Number(process.argv[1]), 0)', String(pid)]
+}
+async function removeFiles($, paths) {
+  if (paths.length) await $.process.run(removeArgv(paths))
 }
 
 // Memories, not counting the index

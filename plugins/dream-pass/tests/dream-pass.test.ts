@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import {
-  conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parsePlan, redirectLinks, safeName, snippets, summary, suspects,
+  aliveArgv, conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parentDir, parsePlan, redirectLinks, removeArgv, renameArgv,
+  safeName, snippets, summary, suspects, userRows,
 } from '../hooks/register.js'
 
 const memo = (description: string) => `---\nname: x\ndescription: ${description}\nmetadata:\n  type: feedback\n---\nbody\n`
@@ -104,4 +105,29 @@ test('snippets cut each matching line around the word', async () => {
 test('links to a merged file point at the file it went into, labels kept', async () => {
   expect(redirectLinks('see [[pnpm]] and [[pnpm|the rule]] and [[noaa-api]]', { pnpm: 'package-manager' }))
     .toBe('see [[package-manager]] and [[package-manager|the rule]] and [[noaa-api]]')
+})
+
+test('parentDir takes off the last part of a Unix or a Windows path', async () => {
+  expect(parentDir('/home/u/.claude/projects/p/memory')).toBe('/home/u/.claude/projects/p')
+  expect(parentDir('C:\\Users\\User\\.claude\\projects\\p\\memory')).toBe('C:\\Users\\User\\.claude\\projects\\p')
+  expect(parentDir('C:\\Users\\User/.claude/projects/p/memory')).toBe('C:\\Users\\User/.claude/projects/p')
+})
+
+test('userRows keeps the user rows of a transcript, LF or CRLF, with no grep', async () => {
+  const text = '{"type":"user","a":1}\r\n{"type": "assistant"}\r\n{"type": "user","b":2}\n'
+  expect(userRows(text)).toEqual(['{"type":"user","a":1}', '{"type": "user","b":2}'])
+  expect(userRows('')).toEqual([])
+})
+
+test('delete, rename and the liveness check run node with the paths as arguments, never rm, mv or kill', async () => {
+  const rm = removeArgv(['C:\\m\\a.md', '/m/b c.md'])
+  expect(rm.slice(0, 2)).toEqual(['node', '-e'])
+  expect(rm.slice(3)).toEqual(['C:\\m\\a.md', '/m/b c.md'])
+  expect(rm[2]).toMatch(/rmSync\(p, \{ force: true \}\)/)
+  const mv = renameArgv('/m/.dream-backup/1', '/m/.dream-backup/undone-1')
+  expect(mv.slice(0, 2)).toEqual(['node', '-e'])
+  expect(mv.slice(3)).toEqual(['/m/.dream-backup/1', '/m/.dream-backup/undone-1'])
+  const alive = aliveArgv(4242)
+  expect([alive[0], alive[1], alive[3]]).toEqual(['node', '-e', '4242'])
+  expect(alive[2]).toMatch(/process\.kill\(/)
 })
