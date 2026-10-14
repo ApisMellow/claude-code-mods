@@ -161,8 +161,10 @@ function resultOf(stdout) {
 // Find the id of the assistant message that asked the question, in the session's transcript
 async function lastAssistantId($, sid, answer) {
   // The Stop hook's transcript path names the folder; without it, rebuild it from the cwd
-  const folder = transcriptPath ? transcriptPath.replace(/\/[^/]+$/, '') :
-    (await $.env.get('HOME')) + '/.claude/projects/' + (await $.session.cwd()).replace(/[^a-zA-Z0-9]/g, '-')
+  // (a Windows path uses \, and a native Windows terminal sets USERPROFILE, not HOME)
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
+  const folder = transcriptPath ? transcriptPath.replace(/[\\/][^\\/]+$/, '') :
+    home + '/.claude/projects/' + (await $.session.cwd()).replace(/[^a-zA-Z0-9]/g, '-')
   const file = folder + '/' + sid + '.jsonl'
   if (!(await $.fs.exists(file))) return undefined
   const lines = (await $.fs.read(file)).split('\n')
