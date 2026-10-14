@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { parseMermaid } from '../hooks/draw.js'
 import { toMermaid } from '../hooks/graph.js'
+import { fileName } from '../hooks/register.js'
 
 // One test per finding of the PR #11 review
 
@@ -167,4 +168,11 @@ test("a pin's change field keeps its key when a new diagram is pinned", async ($
   expect(String((await call($, { tool: 'mcp__diagram-pane__diagram_get' })).result)).toContain('## pin:2: "checkout"')
   expect(before).toBeDefined()
   expect((await ui.find({ type: 'Input' } as never))?.key).toBe(before)
+})
+
+test('a file name is the part after the last / or \\', async () => {
+  expect(fileName('/w/proj/src/app.ts')).toBe('app.ts')
+  expect(fileName('C:\\proj\\src\\app.ts')).toBe('app.ts')
+  expect(fileName('C:\\proj/src\\app.ts')).toBe('app.ts')
+  expect(fileName(undefined)).toBe('')
 })

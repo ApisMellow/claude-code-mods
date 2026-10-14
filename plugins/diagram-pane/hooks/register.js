@@ -349,8 +349,13 @@ function mapSummary() {
 // Files Claude read, wrote or edited whose names the map does not mention
 function newFiles(messages) {
   const onMap = S.map.graph.nodes.map(n => n.label).join(' ')
-  const names = messages.flatMap(m => (m.toolUses || []).map(t => String(t.input?.file_path || '').split('/').pop()))
+  const names = messages.flatMap(m => (m.toolUses || []).map(t => fileName(t.input?.file_path)))
   return [...new Set(names)].filter(n => n && !onMap.includes(n))
+}
+
+// The last part of a path, after a / or (on Windows) a \
+export function fileName(path) {
+  return String(path || '').split(/[\\/]/).pop()
 }
 
 // What happened since the map was drawn, as short lines: prompts and tool calls
