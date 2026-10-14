@@ -14,6 +14,7 @@ import {
   header,
   clock,
   merge,
+  findLinkedBelow,
   LABEL_WIDTH,
 } from '../hooks/queue.ts'
 
@@ -166,5 +167,45 @@ m = merge(
   HOLD,
 )
 ok(m.rows.map((r) => r.d.url).join('') === 'yzx', 'merge sorts newest first')
+
+// --- the monorepo search ---------------------------------------------------
+
+// A fake disk: each folder's entries, and the link files that exist.
+const disk = (tree: Record<string, string[]>, links: string[]) => ({
+  list: async (dir: string) => {
+    if (!(dir in tree)) throw new Error('ENOENT ' + dir)
+    return tree[dir].map((n) => ({ name: n.replace(/\/$/, ''), kind: n.endsWith('/') ? 'dir' : 'file' }))
+  },
+  exists: async (path: string) => links.includes(path),
+})
+const walk = (tree: Record<string, string[]>, links: string[], root = 'R') => {
+  const d = disk(tree, links)
+  return findLinkedBelow(root, d.list, d.exists)
+}
+
+ok(
+  (await walk({ R: ['apps/', 'package.json'], 'R/apps': ['web/', 'api/'], 'R/apps/web': ['.vercel/'], 'R/apps/api': [] }, ['R/apps/web/.vercel/project.json'])) === 'R/apps/web',
+  'walk finds a linked package two levels down',
+)
+ok(
+  (await walk({ R: ['a/'], 'R/a': ['b/'], 'R/a/b': ['c/'], 'R/a/b/c': ['.vercel/'] }, ['R/a/b/c/.vercel/project.json'])) === null,
+  'walk stops where find -maxdepth 4 stopped',
+)
+ok(
+  (await walk({ R: ['node_modules/', '.git/', 'web/'], 'R/node_modules': ['x/'], 'R/node_modules/x': ['.vercel/'], 'R/.git': ['.vercel/'], 'R/web': [] }, ['R/node_modules/x/.vercel/project.json', 'R/.git/.vercel/project.json'])) === null,
+  'walk skips node_modules and dot folders',
+)
+ok(
+  (await walk({ R: ['a/', 'b/'], 'R/a': ['deep/'], 'R/a/deep': ['.vercel/'], 'R/b': ['.vercel/'] }, ['R/a/deep/.vercel/project.json', 'R/b/.vercel/project.json'])) === 'R/b',
+  'walk takes the shallowest link first',
+)
+ok(
+  (await walk({ R: ['web/'], 'R/web': ['.vercel/'] }, [])) === null,
+  'a .vercel folder with no project.json is not a link',
+)
+ok(
+  (await walk({ 'C:\\proj': ['web/', 'gone/'], 'C:\\proj/web': ['.vercel/'] }, ['C:\\proj/web/.vercel/project.json'], 'C:\\proj')) === 'C:\\proj/web',
+  'walk works from a Windows root, and skips a folder it cannot list',
+)
 
 console.log(`ok  ${checks} checks passed`)

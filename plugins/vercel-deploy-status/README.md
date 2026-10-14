@@ -104,7 +104,8 @@ that deploy up anyway, up to 60 seconds later.
 
 The poll runs `vercel ls --format json --non-interactive` from the linked
 directory. It looks for the link in the session's directory first, then the
-repo root, then a short `find` of the repo for a linked package in a monorepo.
+repo root, then a short walk of the repo (`$.fs.list`, four levels, skipping
+node_modules and dot folders) for a linked package in a monorepo.
 The first hit wins.
 
 ## Requirements
@@ -163,7 +164,7 @@ hooks/deploy-status.tsx   the three hooks and the JSX; imports ./queue.ts
 hooks/queue.ts            everything with no UI in it: types, the wake regex,
                           the formatters, and the merge of one poll into the
                           next queue. Imports nothing
-test/queue.test.mts       52 checks on queue.ts, on bare Node
+test/queue.test.mts       58 checks on queue.ts, on bare Node
 ```
 
 Three rules of this runtime, learned the hard way and marked in the code:

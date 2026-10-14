@@ -18,6 +18,7 @@ import {
   clock,
   merge,
   isDeployCommand,
+  findLinkedBelow,
 } from './queue.ts'
 
 // The Vercel deploy queue of the linked project, drawn as a block in the band
@@ -41,18 +42,8 @@ async function findLinkedDir($: EngineInterface, cwd: string): Promise<string | 
   const root = (await $.session.repo())?.root ?? cwd
   if (root !== cwd && (await $.fs.exists(`${root}/.vercel/project.json`))) return root
 
-  try {
-    const r = await $.process.run(
-      ['find', root, '-maxdepth', '4', '-type', 'd', '-name', 'node_modules', '-prune', '-o',
-       '-type', 'f', '-path', '*/.vercel/project.json', '-print'],
-      { timeoutMs: 10_000 },
-    )
-    const hit = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean)[0]
-    if (hit) return hit.slice(0, -'/.vercel/project.json'.length)
-  } catch {
-    // No `find`, or it timed out. The plugin stays quiet, which is the point.
-  }
-  return null
+  // A walk with $.fs, not `find`: on Windows `find` is find.exe, which searches text.
+  return findLinkedBelow(root, (dir) => $.fs.list(dir), (path) => $.fs.exists(path))
 }
 
 export const register: Register = (on, options) => {
@@ -71,7 +62,7 @@ export const register: Register = (on, options) => {
 
   // Set by session.start once the project is linked; until then a push has
   // nothing to wake.
-  let wake: (() => void) | null = null
+  let wake: (() => Promise<void>) | null = null
 
   const waiting = (now: number): boolean => pushedAt !== null && now - pushedAt < watchMs
   const inFlightRows = (): Row[] => rows.filter((r) => IN_FLIGHT.has(r.d.state))
@@ -80,7 +71,7 @@ export const register: Register = (on, options) => {
     // A survey owns the band while it is up, and there is nothing to draw
     // when the queue is empty and no push is waiting on a deploy.
     if (e.props.hasSurvey) return next(e)
-    const now = $.clock.now()
+    const now = await $.clock.now()
     if (rows.length === 0 && !waiting(now)) return next(e)
 
     const { Box, Text } = await $.ui.resolve(e)
@@ -126,12 +117,14 @@ export const register: Register = (on, options) => {
 
     // Let the push finish first: Vercel has nothing to report until it lands.
     const result = await next(e)
-    wake?.()
+    await wake?.()
     return result
   })
 
   on('session.start', async ($, e, next) => {
-    if (!e.interactive || e.surface === null) return next(e)
+    // A -p run has no surface to draw on. (There is no `e.interactive`: the
+    // event has `isInteractive`, so the old check kept the mod off everywhere.)
+    if (e.surface == null) return next(e)
 
     const dir = await findLinkedDir($, e.cwd)
     if (!dir) {
@@ -140,7 +133,7 @@ export const register: Register = (on, options) => {
     }
 
     try {
-      const link = JSON.parse(await $.fs.readFile(`${dir}/.vercel/project.json`)) as { projectName?: string }
+      const link = JSON.parse(await $.fs.read(`${dir}/.vercel/project.json`)) as { projectName?: string }
       if (link.projectName) project = link.projectName
     } catch {
       // The label falls back to "vercel"; the CLI still resolves the link.
@@ -165,11 +158,11 @@ export const register: Register = (on, options) => {
           errorShown = true
           $.ui.log(`vercel-deploy-status: ${err instanceof Error ? err.message : String(err)}`)
         }
-        return waiting($.clock.now())
+        return waiting(await $.clock.now())
       }
       errorShown = false
 
-      const now = $.clock.now()
+      const now = await $.clock.now()
       const m = merge(rows, list, now, holdMs)
       for (const d of m.started) {
         $.ui.toast(`▲ ${project}: deploy started (${targetOf(d)})`)
@@ -192,8 +185,9 @@ export const register: Register = (on, options) => {
     }
 
     // A push cancels the pending idle wait and looks now.
-    wake = () => {
-      pushedAt = $.clock.now()
+    // (`$.clock.now()` is a promise, so each read of it is awaited.)
+    wake = async () => {
+      pushedAt = await $.clock.now()
       $.ui.invalidate('ui.render')
       timer?.cancel()
       timer = null
@@ -201,8 +195,8 @@ export const register: Register = (on, options) => {
     }
 
     // The clocks on the band tick between polls.
-    $.clock.every(1000, () => {
-      if (rows.length > 0 || waiting($.clock.now())) $.ui.invalidate('ui.render')
+    $.clock.every(1000, async () => {
+      if (rows.length > 0 || waiting(await $.clock.now())) $.ui.invalidate('ui.render')
     })
     void loop()
 
