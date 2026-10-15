@@ -696,6 +696,71 @@ for (const text of ROUND_TRIP) {
   if (restore(scrub(param)) !== `https://x.io/?api_key=${ANTHROPIC}`) fail('LOSS  a placeholder in a query parameter')
 }
 
+// allowUrlHosts: the path on a listed host is kept; the query, the fragment,
+// lookalike hosts and vendor-shaped keys are still hidden. Each check uses its
+// own id, because a value hidden once is hidden wherever it turns up again.
+{
+  const urlCfg = makeConfig({ allowUrlHosts: 'app.todoist.com, https://linear.app/, localhost:3000, *.example.dev, my_host.local' })
+  const slug = (): string => `check-real-user-lcp-on-mobile-${mixed(16)}`
+  const probe = `https://app.todoist.com/app/task/${slug()}`
+  if (scrub(probe) === probe) fail('MISS  allowUrlHosts: the default config no longer hides a task slug, so this test proves nothing')
+  for (const text of [
+    `https://app.todoist.com/app/task/${slug()}`,
+    `see https://app.todoist.com/app/task/${slug()}.`,
+    `https://linear.app/acme/issue/ENG-1/${slug()}`,
+    `https://APP.todoist.com:443/app/task/${slug()}`,
+    `{"url":"https:\\/\\/app.todoist.com\\/app\\/task\\/${slug()}"}`,
+    `http://localhost:3000/t/${slug()}`,
+    `https://eu.app.example.dev/t/${slug()}`,
+    `https://my_host.local/t/${slug()}`,
+  ]) {
+    if (scrubSecrets(text, urlCfg) !== text) fail(`FALSE POSITIVE  allowUrlHosts: ${text}`)
+  }
+  // The same slug hidden elsewhere in the text is not hidden again inside the link.
+  {
+    const s = slug()
+    const link = `https://app.todoist.com/app/task/${s}`
+    if (!scrubSecrets(`{"slug":"${s}","url":"${link}"}`, urlCfg).includes(`"url":"${link}"`)) fail('MISS  allowUrlHosts: a slug repeated outside the link hid the link')
+  }
+  // An unnamed random value in the query or fragment, which only the token scan can catch.
+  for (const tail of ['?x=', '#']) {
+    const task = `https://app.todoist.com/app/task/${slug()}`
+    const value = mixed(32)
+    if (!leaks(scrub(`https://x.io/${tail}${value}`), value)) {
+      const out = scrubSecrets(`${task}${tail}${value}`, urlCfg)
+      if (leaks(out, value) || !out.startsWith(task)) fail(`MISS  allowUrlHosts: a value after ${tail} on a listed host`)
+    } else fail(`MISS  allowUrlHosts: the default config keeps a value after ${tail}, so this test proves nothing`)
+  }
+  for (const [text, secret] of [
+    ...['https://app.todoist.com.evil.io/task/', 'https://evil.io/app.todoist.com/', 'https://app.todoist.com@evil.io/', 'https://example.dev/t/', 'https://eu.app.todoist.com/t/'].map((u) => {
+      const s = slug()
+      return [u + s, s.slice(-16)]
+    }),
+    [`https://app.todoist.com/${ANTHROPIC}`, ANTHROPIC],
+    // A token that starts inside the path and runs past it is judged whole.
+    ...[mixed(32)].map((k) => [`https://app.todoist.com/x/ab+${k}`, k]),
+  ]) {
+    if (leaks(scrubSecrets(text, urlCfg), secret)) fail(`MISS  allowUrlHosts: ${text.slice(0, 40)}`)
+  }
+  const odd = makeConfig({ allowUrlHosts: 'app.todoist.com, not a host, *bad' }).allowUrlRejected.join('|')
+  if (odd !== 'not a host|*bad') fail(`allowUrlHosts: rejected entries are ${odd}`)
+}
+
+// The two mods carry the same detector and the same tests. When both sit in
+// this repo, the copies must match, or a fix lands in only one of them.
+{
+  const { existsSync, readFileSync } = await import('node:fs')
+  const root = new URL('../../', import.meta.url)
+  const pairs = [
+    ['secret-box/hooks/detect.ts', 'transcript-redactor/hooks/detect.ts'],
+    ['secret-box/tests/detect.test.mts', 'transcript-redactor/test/detect.test.mts'],
+  ]
+  for (const [x, y] of pairs) {
+    const [fx, fy] = [new URL(x!, root), new URL(y!, root)]
+    if (existsSync(fx) && existsSync(fy) && readFileSync(fx, 'utf8') !== readFileSync(fy, 'utf8')) fail(`COPY  ${x} and ${y} differ`)
+  }
+}
+
 // 25. A live placeholder read back from a file is quoted text, not a handle.
 {
   const tag = scrub(`k=${GITHUB}`).slice(2)

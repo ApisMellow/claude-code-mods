@@ -80,6 +80,8 @@ export const register: Register = (on, options) => {
     return out
   }
   const secretsOnly = (text: string): string => (cfg.secrets ? scrubSecrets(text, cfg) : text)
+  // An `allowUrlHosts` entry that is not a host name is said once, not dropped silently.
+  let warnedHosts = cfg.allowUrlRejected.length === 0
 
   // Counts the values hidden, not the placeholders that stand for quoted text.
   const countHidden = (tags: Set<string>): number => [...tags].filter((t) => !t.startsWith('[REDACTED-LITERAL-')).length
@@ -92,6 +94,10 @@ export const register: Register = (on, options) => {
       return { text: scrub(e.text), context: e.context?.map((c) => (guard(c, next), scrub(c))) }
     })
     const n = countHidden(tags)
+    if (!warnedHosts) {
+      warnedHosts = true
+      $.ui.toast(`${brand.name}: allowUrlHosts ignored ${cfg.allowUrlRejected.join(', ')} (not a host name)`)
+    }
     if (n > 0 && cfg.notify) $.ui.toast(`${brand.name}: hid ${n} value(s) from the prompt`)
     if (tags.size === 0) return next(e)
     return next({ ...e, text: value.text, ...(value.context ? { context: value.context } : {}) })

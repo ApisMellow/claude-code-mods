@@ -68,6 +68,7 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 | `allow` | empty | Exact strings never to hide, comma separated |
 | `allowEmails` | empty | Addresses or `@domain.com` never to hide |
 | `allowPrefixes` | empty | Extra id prefixes to treat as public |
+| `allowUrlHosts` | empty | Hosts (`app.todoist.com`, `localhost:3000`, `*.example.com`) whose link paths are kept as written. A host covers itself only; `*.` covers its subdomains. The query string and fragment are still scanned, and a vendor-shaped key in the path is still hidden. Don't list a host that puts credentials in the path (Slack webhooks, Telegram bot links, presigned links): a random-looking secret there would be kept too |
 | `denyPrefixes` | empty | Prefixes to test even though they look like a public id |
 
 Stripe object ids (`price_`, `prod_`, `cus_`, `pk_live_` and so on) are public and are never hidden. Neither are git SHAs, file paths or names written in code.

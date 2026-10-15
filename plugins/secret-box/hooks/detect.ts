@@ -29,6 +29,9 @@ export type Config = {
   allowEmails: readonly string[]
   allowPrefix: readonly string[]
   denyPrefix: readonly string[]
+  allowUrl: AllowUrl
+  // Entries of `allowUrlHosts` that are not a host name, shown once.
+  allowUrlRejected: readonly string[]
 }
 
 // The tools that run on this machine. A placeholder is only swapped back for
@@ -704,9 +707,54 @@ const REDACTED_THINKING = /("type"\s*:\s*"redacted_thinking"\s*,\s*"data"\s*:\s*
 // glued after `sha256-` is still judged.
 const SRI = /\bsha(?:1-[A-Za-z0-9+/]{27}=|256-[A-Za-z0-9+/]{43}=|384-[A-Za-z0-9+/]{64}|512-[A-Za-z0-9+/]{86}==)(?![A-Za-z0-9+/=])/g
 
-// Public font files: the file name is a hash, not a secret. Path characters
-// only, so a query string on the same URL is still scanned.
-const PUBLIC_URL = /https:\/\/fonts\.gstatic\.com\/[A-Za-z0-9_/.-]+/g
+// Links whose path is kept as written: public font files (the file name is
+// a hash, not a secret) and the hosts of the `allowUrlHosts` option (a task
+// link like `/app/task/<slug>-<id>`). The host has to follow the scheme and be
+// followed by a port or `/`, so `evil.com/<host>/`, `<host>.evil.com` and
+// `<host>@evil.com` don't match. The slashes may be JSON-escaped (`\/`). Path
+// characters only, so a query string or fragment is still scanned.
+type AllowUrl = { hint: RegExp; re: RegExp }
+const BUILT_IN_URL_HOSTS = ['fonts.gstatic.com']
+const HOST_NAME = /^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9])?$/
+const IPV6_HOST = /^\[[0-9a-f:.]+\]$/
+
+// `https://Host:8080/path` becomes `host`. An IPv6 literal keeps its brackets.
+function cleanHost(entry: string): string {
+  const h = entry.toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, '').replace(/[/?#].*$/, '').replace(/^[^@]*@/, '')
+  return h.startsWith('[') ? h.replace(/\](?::\d+)?$/, ']') : h.replace(/:\d*$/, '')
+}
+
+function allowUrlHosts(entries: string[]): { hosts: string[]; rejected: string[] } {
+  const hosts: string[] = []
+  const rejected: string[] = []
+  for (const e of entries) {
+    const h = cleanHost(e)
+    if (HOST_NAME.test(h) || IPV6_HOST.test(h)) hosts.push(h)
+    else rejected.push(e)
+  }
+  return { hosts, rejected }
+}
+
+const reEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// `*.example.com` stands for any subdomain of example.com, not example.com.
+function allowUrlPattern(hosts: string[]): AllowUrl {
+  const all = [...new Set([...BUILT_IN_URL_HOSTS, ...hosts])]
+  const alt = all.map((h) => (h.startsWith('*.') ? String.raw`(?:[a-z0-9_-]+\.)+${reEscape(h.slice(2))}` : reEscape(h))).join('|')
+  const hint = new RegExp(all.map((h) => reEscape(h.replace(/^\*\./, ''))).join('|'), 'i')
+  const slash = String.raw`(?:\/|\\\/)`
+  return { hint, re: new RegExp(String.raw`https?:${slash}${slash}(?:${alt})(?::\d{1,5})?${slash}(?:[A-Za-z0-9_.~%-]|${slash})*`, 'gi') }
+}
+
+// Parks the path of each allowed link before anything else runs, so neither
+// the token scan nor a value hidden elsewhere in the text can touch it. A path
+// holding a vendor-shaped key is not parked; the passes judge it as usual.
+// Parking also ends the path cleanly: in `/x/ab+<key>` only `/x/ab` is
+// parked, and `<key>` is judged on its own.
+function parkAllowedUrls(text: string, cfg: Config): string {
+  if (!text.includes(':') || !cfg.allowUrl.hint.test(text)) return text
+  return text.replace(cfg.allowUrl.re, (m) => (scrubVendors(m, cfg) === m ? park(m) : m))
+}
 
 // Mail: an optional `cat -n`, Read or `grep -n` prefix on each line.
 const PFX = String.raw`(?:[ \t]*\d+\t|[^\s:]+:\d+[:-])?`
@@ -1378,7 +1426,6 @@ function protectedSpans(text: string, boundaries: Set<string>): Spans {
   const spans = new Spans()
   mimeBodySpans(text, spans)
   mailSpans(text, spans, boundaries)
-  if (text.includes('fonts.gstatic.com')) for (const m of text.matchAll(PUBLIC_URL)) spans.add(m.index!, m.index! + m[0].length)
   // The Cloudflare Web Analytics beacon token is public, on every page.
   if (text.includes('data-cf-beacon')) for (const m of text.matchAll(CF_BEACON)) spans.add(m.index!, m.index! + m[0].length)
   return spans.seal()
@@ -1440,7 +1487,7 @@ export function scrubSecrets(text: string, cfg: Config): string {
   parked = startParking(text)
   local = new Set()
   try {
-    let out = rehideKnown(text)
+    let out = rehideKnown(parkAllowedUrls(text, cfg))
     out = parkOpaque(out)
     out = scrubKeyBlocks(out, cfg)
     if (out.includes('eyJ')) out = out.replace(DOTTED, (m) => scrubJwtChain(m, cfg))
@@ -1580,6 +1627,7 @@ function strings(v: unknown): string[] {
 
 export function makeConfig(options: Record<string, unknown>): Config {
   const tools = options.restoreTools === undefined ? DEFAULT_RESTORE_TOOLS : options.restoreTools
+  const urlHosts = allowUrlHosts(strings(options.allowUrlHosts))
   return {
     secrets: bool(options.secrets, true),
     pii: bool(options.pii, false),
@@ -1595,5 +1643,7 @@ export function makeConfig(options: Record<string, unknown>): Config {
     allowEmails: strings(options.allowEmails),
     allowPrefix: strings(options.allowPrefixes),
     denyPrefix: strings(options.denyPrefixes),
+    allowUrl: allowUrlPattern(urlHosts.hosts),
+    allowUrlRejected: urlHosts.rejected,
   }
 }

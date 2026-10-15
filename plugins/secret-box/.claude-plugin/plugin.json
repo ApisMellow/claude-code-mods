@@ -1,6 +1,6 @@
 {
   "name": "secret-box",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Claude can use a secret without seeing it: a masked box saves keys to .env and gives Claude a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
   "author": {
     "name": "Ray Amjad",
@@ -85,6 +85,12 @@
       "type": "string",
       "title": "Never hide tokens starting with",
       "description": "Extra id prefixes to treat as public, separated by commas (price_, prod_ and the other Stripe object ids are already public)",
+      "default": ""
+    },
+    "allowUrlHosts": {
+      "type": "string",
+      "title": "Never hide URL paths on these hosts",
+      "description": "Hosts such as app.todoist.com or *.example.com, separated by commas. The path of a link on one of them is kept as written; its query string is still scanned. Never list a host that puts credentials in the path",
       "default": ""
     },
     "denyPrefixes": {
