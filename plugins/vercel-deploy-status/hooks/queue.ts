@@ -164,3 +164,34 @@ export function merge(rows: Row[], list: Deployment[], now: number, holdMs: numb
   nextRows.sort((a, b) => b.d.createdAt - a.d.createdAt)
   return { rows: nextRows, started, finished }
 }
+
+// --- the monorepo search ----------------------------------------------------
+
+// One entry of a folder listing, as `$.fs.list` gives it.
+export type Entry = { name: string; kind: string }
+
+// The first folder under `root` that holds .vercel/project.json, shallowest
+// first. It used to be `find root -maxdepth 4 ... -path */.vercel/project.json`,
+// which a native Windows terminal does not have, so it walks `list` instead:
+// the link file at most four levels down (the linked folder at most two),
+// skipping node_modules and dot folders other than .vercel. A folder that
+// cannot be listed is skipped.
+export async function findLinkedBelow(
+  root: string,
+  list: (dir: string) => Promise<Entry[]>,
+  exists: (path: string) => Promise<boolean>,
+): Promise<string | null> {
+  let level = [root]
+  for (let depth = 0; depth <= 2 && level.length > 0; depth++) {
+    // Each level is listed at once, not one folder after another
+    const listed = await Promise.all(level.map(async (dir) => {
+      const dirs = (await list(dir).catch(() => [] as Entry[])).filter((e) => e.kind === 'dir')
+      const linked = dirs.some((e) => e.name === '.vercel') && (await exists(`${dir}/.vercel/project.json`).catch(() => false))
+      return { dir, dirs, linked }
+    }))
+    const hit = listed.find((l) => l.linked)
+    if (hit) return hit.dir
+    level = listed.flatMap((l) => l.dirs.filter((e) => e.name !== 'node_modules' && !e.name.startsWith('.')).map((e) => `${l.dir}/${e.name}`))
+  }
+  return null
+}

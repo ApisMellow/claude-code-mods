@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { isAbsolute, isEnvFile, isNotFound, WAITS } from '../hooks/register'
+
 // Fake keys, built at run time so no key-shaped string sits in the repo
 const STRIPE = 'sk_' + 'live_' + 'A1b2C3d4E5f6G7h8J9k0L1m2'
 const WEAK = 'hunter' + '2hunter2' // a short password the detector alone would miss
@@ -9,14 +11,17 @@ const call = async ($: any, input: Record<string, unknown>) => (await $.tool.cal
 
 // Stand in for Claude Code beneath the mod: the tool "prints" `output`,
 // git reports `staged`, and .env holds `dotenv`.
-function stubs(on: any, opts: { output?: string; staged?: string; dotenv?: string; seen?: string[] } = {}) {
+function stubs(on: any, opts: { output?: string; staged?: string; dotenv?: string; seen?: string[]; cwd?: string; looked?: string[] } = {}) {
   on('tool.call', (_$: unknown, e: Record<string, unknown>) => {
     opts.seen?.push(String(e.command ?? ''))
     return { result: opts.output ?? 'ran' }
   })
   on('process.run', () => ({ value: { exitCode: 0, stdout: opts.staged ?? '', stderr: '' } }))
-  on('session.cwd', () => ({ value: '/repo' }))
-  on('fs.exists', () => ({ value: opts.dotenv !== undefined }))
+  on('session.cwd', () => ({ value: opts.cwd ?? '/repo' }))
+  on('fs.exists', (_$: unknown, e: { path: string }) => {
+    opts.looked?.push(e.path)
+    return { value: opts.dotenv !== undefined }
+  })
   on('fs.read', () => ({ value: opts.dotenv ?? '' }))
 }
 
@@ -158,4 +163,34 @@ test('git -C checks the repository it names', async ($, on) => {
 test('a commit is blocked when git cannot say what it includes', async ($, on) => {
   gitStub(on, { fails: true })
   expect(Boolean((await call($, { tool: 'Bash', command: 'git commit -m wip' })).deny)).toBe(true)
+})
+
+test('a Windows .env path is read where it is, and its weak values are hidden', async ($, on) => {
+  const plain = 'staple' + 'gunwindow' // letters only: no detector rule fires on it
+  const looked: string[] = []
+  stubs(on, { output: `PORT=3000\nADMIN_PASS=${plain}\n`, dotenv: `ADMIN_PASS=${plain}\n`, cwd: 'C:\\repo', looked })
+  const out = String((await call($, { tool: 'Read', file_path: 'C:\\repo\\.env' })).result)
+  // The engine resolves a fs path with the host's path rules, so off Windows it gets a prefix
+  expect(looked.some(p => p.endsWith('C:\\repo\\.env'))).toBe(true)
+  expect(out).not.toContain(plain)
+  expect(out).toContain('PORT=3000')
+})
+
+test('isEnvFile takes the name after a / or a \\', async () => {
+  expect(isEnvFile('C:\\repo\\.env.local')).toBe(true)
+  expect(isEnvFile('/repo/.env')).toBe(true)
+  expect(isEnvFile('C:\\repo\\.env.example')).toBe(false)
+  expect(isEnvFile('C:\\repo\\app.env')).toBe(false)
+})
+
+test('isAbsolute knows Unix, drive-letter and UNC paths', async () => {
+  for (const p of ['/repo/.env', 'C:\\repo\\.env', 'd:/repo/.env', '\\\\server\\share\\.env']) expect(isAbsolute(p)).toBe(true)
+  for (const p of ['.env', 'config\\.env', 'C:.env', '~/.env']) expect(isAbsolute(p)).toBe(false)
+})
+
+test('the box waits with sleep on Mac and Linux, and with node, else ping, on Windows', async () => {
+  expect(WAITS.unix).toEqual([['sleep', '0.3']])
+  expect(WAITS.windows.map(w => w[0])).toEqual(['node', 'ping'])
+  expect(isNotFound(new Error("$.process.run(node) failed to start: ENOENT: Command 'node' not found"))).toBe(true)
+  expect(isNotFound(new Error('timed out'))).toBe(false)
 })

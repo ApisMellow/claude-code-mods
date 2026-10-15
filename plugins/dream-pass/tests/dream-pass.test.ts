@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import {
-  conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parsePlan, redirectLinks, safeName, snippets, summary, suspects,
+  commandFor, conversationSince, dropDeadPointers, indexProblems, keywords, originIds, parentDir, parsePlan, redirectLinks,
+  safeName, snippets, summary, suspects, userRows,
 } from '../hooks/register.js'
 
 const memo = (description: string) => `---\nname: x\ndescription: ${description}\nmetadata:\n  type: feedback\n---\nbody\n`
@@ -104,4 +105,36 @@ test('snippets cut each matching line around the word', async () => {
 test('links to a merged file point at the file it went into, labels kept', async () => {
   expect(redirectLinks('see [[pnpm]] and [[pnpm|the rule]] and [[noaa-api]]', { pnpm: 'package-manager' }))
     .toBe('see [[package-manager]] and [[package-manager|the rule]] and [[noaa-api]]')
+})
+
+test('parentDir takes off the last part of a Unix or a Windows path', async () => {
+  expect(parentDir('/home/u/.claude/projects/p/memory')).toBe('/home/u/.claude/projects/p')
+  expect(parentDir('C:\\Users\\User\\.claude\\projects\\p\\memory')).toBe('C:\\Users\\User\\.claude\\projects\\p')
+  expect(parentDir('C:\\Users\\User/.claude/projects/p/memory')).toBe('C:\\Users\\User/.claude/projects/p')
+})
+
+test('userRows keeps the user rows of a transcript, LF or CRLF, with no grep', async () => {
+  const text = '{"type":"user","a":1}\r\n{"type": "assistant"}\r\n{"type": "user","b":2}\n'
+  expect(userRows(text)).toEqual(['{"type":"user","a":1}', '{"type": "user","b":2}'])
+  expect(userRows('')).toEqual([])
+})
+
+test('Mac and Linux use rm, mv, kill and grep, as before', async () => {
+  expect(commandFor(false, 'remove', ['/m/a.md', '/m/b c.md'])).toEqual([['rm', '-f', '/m/a.md', '/m/b c.md'], {}])
+  expect(commandFor(false, 'rename', '/m/1', '/m/undone-1')).toEqual([['mv', '/m/1', '/m/undone-1'], {}])
+  expect(commandFor(false, 'alive', 4242)).toEqual([['kill', '-0', '4242'], {}])
+  expect(commandFor(false, 'userRows', '/t/s.jsonl')).toEqual([['grep', '-E', '"type": ?"user"', '/t/s.jsonl'], {}])
+})
+
+test('Windows uses PowerShell, with each path in an env var and never in the script', async () => {
+  const paths = ['C:\\m\\a.md', "C:\\m\\b c'; rm -r x.md"]
+  for (const [job, arg, to] of [['remove', paths], ['rename', 'C:\\m\\1', 'C:\\m\\undone-1'], ['alive', 4242], ['userRows', 'C:\\t\\s.jsonl']] as const) {
+    const [argv, init] = commandFor(true, job, arg, to)
+    expect(argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+    expect(argv[4]).toContain('$env:DREAM_PASS_ARG')
+    for (const p of [paths, arg, to].flat()) if (p !== undefined) expect(argv[4]).not.toContain(String(p))
+  }
+  expect(commandFor(true, 'remove', paths)[1]).toEqual({ env: { DREAM_PASS_ARG: paths.join('\n') } })
+  expect(commandFor(true, 'rename', 'C:\\m\\1', 'C:\\m\\undone-1')[1]).toEqual({ env: { DREAM_PASS_ARG: 'C:\\m\\1', DREAM_PASS_TO: 'C:\\m\\undone-1' } })
+  expect(commandFor(true, 'alive', 4242)[1]).toEqual({ env: { DREAM_PASS_ARG: '4242' } })
 })

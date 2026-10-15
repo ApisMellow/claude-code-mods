@@ -48,10 +48,41 @@ export const parseOps = (text: string) => {
 }
 
 const memoryDir = async ($: EngineInterface) => {
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${await $.env.get('HOME')}/.claude`
+  // A native Windows terminal sets USERPROFILE, not HOME
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`
   const slug = (await $.session.cwd()).replace(/[^A-Za-z0-9]/g, '-')
 
   return `${config}/projects/${slug}/memory`
+}
+
+// $.fs has no remove, so a command deletes. A native Windows terminal has no
+// rm, and node is not promised there, so PowerShell does it, which every
+// Windows has. The paths go in an env var, never in the script, so nothing in
+// a path can run as code.
+export const removeCommand = (isWindows: boolean, paths: string[]): [string[], { env?: Record<string, string> }] =>
+  isWindows
+    ? [
+        [
+          'powershell',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          'foreach ($p in ($env:MEMORY_FORK_PATHS -split "`n")) { if ($p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }',
+        ],
+        { env: { MEMORY_FORK_PATHS: paths.join('\n') } },
+      ]
+    : [['rm', '-f', ...paths], {}]
+
+// C:\x, C:/x, or a share: \\server\x or //server/x
+const WINDOWS_PATH = /^([A-Za-z]:[\\/]|\\\\|\/\/)/
+
+// Whether path is inside dir, with / or \ as the separator. Windows paths are compared without case.
+export const isInside = (path: string, dir: string) => {
+  const windows = WINDOWS_PATH.test(dir) || WINDOWS_PATH.test(path)
+  const norm = (p: string) => (windows ? p.replace(/\\/g, '/').toLowerCase() : p)
+
+  return norm(path).startsWith(`${norm(dir)}/`)
 }
 
 const memoryFiles = async ($: EngineInterface, dir: string): Promise<FsEntry[]> =>
@@ -165,7 +196,11 @@ async function write($: EngineInterface) {
     return setRun($, id, { status: 'failed', reason: 'fork did not answer with JSON' })
   }
   for (const one of ops.write) await $.fs.write(`${dir}/${one.name}`, one.content)
-  if (ops.delete.length > 0) await $.process.run(['rm', '-f', ...ops.delete.map(name => `${dir}/${name}`)])
+  if (ops.delete.length > 0) {
+    const paths = ops.delete.map(name => `${dir}/${name}`)
+    const [argv, init] = removeCommand((await $.env.get('OS')) === 'Windows_NT', paths)
+    await $.process.run(argv, init)
+  }
 
   await setRun($, id, { status: 'done', changes: diff(before, await readMemory($, dir)) })
 }
@@ -204,7 +239,7 @@ export const register: Register = on => {
     if (e.agentId !== undefined) return next(e)
     const dir = await memoryDir($)
 
-    return e.file_path.startsWith(`${dir}/`)
+    return isInside(e.file_path, dir)
       ? { deny: 'memory-fork: memory is written by the background fork at the end of the turn, not by the main session.' }
       : next(e)
   }).catch(($, e, next) => next(e))

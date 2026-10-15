@@ -297,7 +297,7 @@ async function apply($, dir, files, plan, stamp, why) {
   for (const m of plan.merged) {
     await $.fs.write(dir + '/' + m.into, m.content)
     for (const from of m.from) {
-      await $.process.run(['rm', '-f', dir + '/' + from])
+      await removeFiles($, [dir + '/' + from])
       changes.push({ kind: 'merged', file: from, why: 'merged into ' + m.into })
     }
   }
@@ -306,7 +306,7 @@ async function apply($, dir, files, plan, stamp, why) {
     changes.push({ kind: 'rewritten', file: w.file, why: w.why || '' })
   }
   for (const d of plan.removed) {
-    await $.process.run(['rm', '-f', dir + '/' + d.file])
+    await removeFiles($, [dir + '/' + d.file])
     changes.push({ kind: 'removed', file: d.file, why: d.why || '' })
   }
   for (const a of plan.added) {
@@ -356,12 +356,11 @@ async function undo($, options) {
   const stamp = stamps[stamps.length - 1]
   const saved = await readMemory($, root + '/' + stamp)
   delete saved['DREAM.md']
-  for (const name of Object.keys(await readMemory($, dir))) {
-    if (!(name in saved)) await $.process.run(['rm', '-f', dir + '/' + name])
-  }
+  await removeFiles($, Object.keys(await readMemory($, dir)).filter((name) => !(name in saved)).map((name) => dir + '/' + name))
   for (const [name, text] of Object.entries(saved)) await $.fs.write(dir + '/' + name, text)
   // Retire the used backup, so a second undo goes one dream further back
-  await $.process.run(['mv', root + '/' + stamp, root + '/undone-' + stamp])
+  const [from, to] = [root + '/' + stamp, root + '/undone-' + stamp]
+  await runJob($, 'rename', from, to)
   const run = S.runs.findLast((r) => r.stamp === stamp)
   if (run) finish($, run, { status: 'undone', note: 'restored the backup from ' + stamp })
   else addRun($, { why: 'undo', status: 'undone', note: 'restored the backup from ' + stamp })
@@ -409,7 +408,7 @@ async function gatherEvidence($, dir, files, sid) {
 // Transcripts sit beside the memory folder: projects/<project>/<session>.jsonl
 async function transcriptsDir($, dir) {
   const set = await $.env.get('DREAM_PASS_TRANSCRIPTS_DIR')
-  for (const d of [set, dir.replace(/\/[^/]+$/, '')]) {
+  for (const d of [set, parentDir(dir)]) {
     if (!d || !(await $.fs.exists(d))) continue
     if ((await $.fs.list(d)).some((e) => e.name.endsWith('.jsonl'))) return d
   }
@@ -418,10 +417,9 @@ async function transcriptsDir($, dir) {
 
 // What the user typed in one session (not tool results, not slash command plumbing)
 async function sessionText($, path) {
-  const r = await $.process.run(['grep', '-E', '"type": ?"user"', path])
   const lines = []
   let date = '?'
-  for (const raw of r.stdout.split('\n')) {
+  for (const raw of await userRowsOf($, path)) {
     let o
     try { o = JSON.parse(raw) } catch { continue }
     if (o.isMeta || !o.message) continue
@@ -495,7 +493,8 @@ async function autoDreamRunning($, dir) {
     const lock = dir + '/.consolidate-lock'
     if (Date.now() - (await $.fs.stat(lock)).mtimeMs > 3600000) return false
     const pid = parseInt((await $.fs.read(lock)).trim(), 10)
-    return pid > 0 && (await $.process.run(['kill', '-0', String(pid)])).exitCode === 0
+    if (!(pid > 0)) return false
+    return (await runJob($, 'alive', pid)).exitCode === 0
   } catch {
     return false
   }
@@ -506,9 +505,10 @@ async function autoDreamRunning($, dir) {
 // Where the memory lives: the memoryDir option, DREAM_PASS_MEMORY_DIR, the
 // autoMemoryDirectory setting, else Claude Code's own folder for the git root
 async function memoryDir($, options) {
-  const home = await $.env.get('HOME')
+  // A native Windows terminal sets USERPROFILE, not HOME
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
   const set = options?.memoryDir || (await $.env.get('DREAM_PASS_MEMORY_DIR')) || (await $.settings.read()).autoMemoryDirectory
-  if (set) return set.replace(/^~(?=\/)/, home).replace(/\/$/, '')
+  if (set) return set.replace(/^~(?=[\\/])/, home).replace(/[\\/]$/, '')
   const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || home + '/.claude'
   const repo = await $.session.repo()
   const root = repo ? repo.root : await $.session.cwd()
@@ -525,6 +525,71 @@ async function readMemory($, dir, dates = {}) {
     dates[entry.name] = new Date(entry.mtimeMs).toISOString().slice(0, 10)
   }
   return files
+}
+
+// The folder a path is in, whichever separator it uses
+export function parentDir(path) {
+  return path.replace(/[\\/][^\\/]+$/, '')
+}
+
+// The rows of a transcript that came from the user (what `grep '"type": ?"user"'` found)
+export function userRows(text) {
+  return text.split(/\r?\n/).filter((row) => /"type": ?"user"/.test(row))
+}
+
+// A transcript's user rows. A command reads the file, so a transcript over
+// $.fs.read's 4 MiB still counts; if the command fails, $.fs.read does it.
+async function userRowsOf($, path) {
+  try {
+    const r = await runJob($, 'userRows', path)
+    if (r.exitCode <= 1) return userRows(r.stdout) // grep exits 1 when nothing matched
+  } catch {}
+  return userRows(await $.fs.read(path).catch(() => ''))
+}
+
+// ---------- commands ----------
+
+// Mac and Linux have rm, mv, kill and grep. A native Windows terminal has none
+// of them ($.process.run throws ENOENT, and a `kill` from Git Bash does not
+// know Windows PIDs), and $.fs has no remove or rename. So on Windows
+// PowerShell does each job: every Windows has it, where node is not promised.
+// A path reaches PowerShell in an environment variable, never in the script,
+// so nothing in a path can run as code.
+const POWERSHELL = {
+  remove: 'foreach ($p in ($env:DREAM_PASS_ARG -split "`n")) { if ($p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }',
+  rename: 'Move-Item -LiteralPath $env:DREAM_PASS_ARG -Destination $env:DREAM_PASS_TO -ErrorAction Stop',
+  alive: 'if (Get-Process -Id $env:DREAM_PASS_ARG -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }',
+  // Read with sharing, as Claude Code may be writing the file; print UTF-8.
+  // Exit 2 on an error, as grep does, so the caller falls back.
+  userRows:
+    'try { $r = New-Object IO.StreamReader((New-Object IO.FileStream($env:DREAM_PASS_ARG, "Open", "Read", "ReadWrite")), [Text.Encoding]::UTF8); ' +
+    '$o = [Console]::OpenStandardOutput(); ' +
+    'while ($null -ne ($l = $r.ReadLine())) { if ($l -match \'"type": ?"user"\') { $b = [Text.Encoding]::UTF8.GetBytes($l + "`n"); $o.Write($b, 0, $b.Length) } } } catch { exit 2 }',
+}
+
+// The argv and env for one job: remove (a list of paths), rename (from, to),
+// alive (a pid: exit 0 while it runs, like `kill -0`) or userRows (a path)
+export function commandFor(isWindows, job, arg, to) {
+  if (isWindows) {
+    const value = Array.isArray(arg) ? arg.join('\n') : String(arg)
+    return [
+      ['powershell', '-NoProfile', '-NonInteractive', '-Command', POWERSHELL[job]],
+      { env: { DREAM_PASS_ARG: value, ...(to === undefined ? {} : { DREAM_PASS_TO: to }) } },
+    ]
+  }
+  if (job === 'remove') return [['rm', '-f', ...arg], {}]
+  if (job === 'rename') return [['mv', arg, to], {}]
+  if (job === 'alive') return [['kill', '-0', String(arg)], {}]
+  return [['grep', '-E', '"type": ?"user"', arg], {}]
+}
+
+async function runJob($, job, arg, to) {
+  const [argv, init] = commandFor((await $.env.get('OS')) === 'Windows_NT', job, arg, to)
+  return $.process.run(argv, init)
+}
+
+async function removeFiles($, paths) {
+  if (paths.length) await runJob($, 'remove', paths)
 }
 
 // Memories, not counting the index

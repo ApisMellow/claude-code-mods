@@ -195,8 +195,11 @@ const score = async ($: Engine, text: string) => {
   }
 }
 
+// A native Windows terminal sets USERPROFILE, not HOME
+export const homeDir = (home: string | undefined, profile: string | undefined) => home ?? profile ?? ''
+
 const scanDisk = async ($: Engine, cwd: string) => {
-  const home = (await $.env.get('HOME')) ?? ''
+  const home = homeDir(await $.env.get('HOME'), await $.env.get('USERPROFILE'))
   const found: Skill[] = []
   for (const root of [`${home}/.claude/skills`, `${cwd}/.claude/skills`]) {
     const entries = await $.fs.list(root).catch(() => [])
