@@ -1,36 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { boxBackend, keychainReads, MACOS_VERSION_FILE, SECURITY, SHELL_ACTIVE } from '../hooks/keychain'
+import { boxBackend, keychainReads, SECURITY, SHELL_ACTIVE } from '../hooks/keychain'
 import { unmaskable } from '../hooks/register'
+import {
+  BOX, call, gLine, hex, hexOf, HOME, LIST, mac, MIGRATE, OTHER, registered, securityCalls, TAG, USE, wOutput,
+  type Item, type Opts,
+} from './fake-mac'
 
-const USE = 'mcp__secret-box__use_secret'
-const BOX = 'mcp__secret-box__request_secret'
-const TAG = /\[REDACTED-SECRET-[0-9a-f]{8}\]/
-const HOME = '/Users/tester'
-const LOGIN = `${HOME}/Library/Keychains/login.keychain-db`
-const OTHER = `${HOME}/Library/Keychains/other.keychain-db`
-
-// Fake Keychain values, built at run time: 48 hex characters, the shape of
-// `openssl rand -hex 24`. Bare hex is a shape the detector leaves alone (it
-// could be a hash), so only the vault can hide it.
-const hex = (seed: number) => Array.from({ length: 48 }, (_, i) => ((i * 7 + seed * 5) % 16).toString(16)).join('')
-
-// ------------------------------------------------- a `security` that answers like the real one
-
-// What /usr/bin/security prints, from its real output on macOS (pinned below):
-// -w prints the text, or lowercase hex when any byte is not printable ASCII;
-// -g prints `password: "text"`, or hex and an escaped copy when any byte is
-// not printable or is " or \, or `password: ` for an empty one.
-const utf8 = (v: string) => (encodeURIComponent(v).match(/%..|./g) || []).map((c) => (c.length === 3 ? parseInt(c.slice(1), 16) : c.charCodeAt(0)))
-const hexOf = (v: string) => utf8(v).map((b) => b.toString(16).padStart(2, '0')).join('')
-const isPrintable = (v: string) => utf8(v).every((b) => b >= 0x20 && b < 0x7f)
-const wOutput = (v: string) => (isPrintable(v) ? v : hexOf(v)) + '\n'
-function gLine(v: string) {
-  if (v === '') return 'password: \n'
-  if (isPrintable(v) && !/["\\]/.test(v)) return `password: "${v}"\n`
-  const escaped = utf8(v).map((b) => (b >= 0x20 && b < 0x7f && b !== 0x5c ? String.fromCharCode(b) : '\\' + b.toString(8).padStart(3, '0'))).join('')
-  return `password: 0x${hexOf(v).toUpperCase()}  "${escaped}"\n`
-}
+// What a Mac session registers
+const MAC_TOOLS = ['request_secret', 'use_secret', 'list_key_names', 'migrate_env_to_keychain']
 
 test('the fake prints exactly what the real security printed for the same values', async () => {
   expect(wOutput('plainvalue123')).toBe('plainvalue123\n')
@@ -46,110 +24,6 @@ test('the fake prints exactly what the real security printed for the same values
   expect(wOutput('')).toBe('\n')
   expect(gLine('')).toBe('password: \n')
 })
-
-// An item, keyed by everything a read can match on: its kind, the match
-// options by flag letter (s service or server, a account, l label, r protocol,
-// P port, ...) and the keychain file it lives in.
-type Item = { kind?: 'generic' | 'internet'; keychain?: string; value: string } & Record<string, string | undefined>
-
-// Answers one `security find-*-password` argv the way the real one does:
-// getopt over the options, then the keychain files (none means the search
-// list, here the login keychain); the first item matching every option.
-function security(items: Item[], argv: string[]) {
-  const kind = argv[1] === 'find-internet-password' ? 'internet' : 'generic'
-  const criteria: [string, string][] = []
-  let g = false
-  let w = false
-  let k = 2
-  for (; k < argv.length && argv[k]!.startsWith('-'); k++) {
-    if (argv[k] === '-g') g = true
-    else if (argv[k] === '-w') w = true
-    else criteria.push([argv[k]!.slice(1), argv[++k]!])
-  }
-  const keychains = argv.slice(k)
-  const item = items.find(
-    (it) =>
-      (it.kind ?? 'generic') === kind &&
-      criteria.every(([f, v]) => it[f] === v) &&
-      (keychains.length ? keychains : [LOGIN]).includes(it.keychain ?? LOGIN),
-  )
-  if (!item) return { exitCode: 44, stdout: '', stderr: 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n' }
-  if (w) return { exitCode: 0, stdout: wOutput(item.value), stderr: '' }
-  const attributes = `keychain: "${item.keychain ?? LOGIN}"\nclass: "${kind === 'generic' ? 'genp' : 'inet'}"\nattributes:\n    "acct"<blob>="${item.a ?? ''}"\n`
-  return { exitCode: 0, stdout: attributes, stderr: g ? gLine(item.value) : '' }
-}
-
-type Answer = { deny?: string; result?: unknown }
-const call = async ($: any, input: Record<string, unknown>) => (await $.tool.call(input as never)) as Answer
-
-type Opts = {
-  items?: Item[]
-  platform?: 'Darwin' | 'Linux'
-  uname?: 'both' | 'bin-only' | 'none' // which of /usr/bin/uname and /bin/uname run (both by default)
-  versionFile?: 'present' | 'absent' | 'fails' // macOS's SystemVersion.plist, asked when no uname answers
-  env?: Record<string, string> // in place of USER and HOME
-  toasts?: string[]
-  fail?: { exitCode: number; stdout: string; stderr: string } // every security call answers this instead
-  deny?: string // every security call is refused (it could not start, or timed out)
-  truncated?: boolean // security's answer was cut off
-  argvs?: string[][]
-  log?: string[]
-  seen?: Record<string, unknown>[]
-  output?: string | ((command: string) => string)
-  writes?: { path: string; text: string }[]
-  opened?: string[]
-  clock?: { sleep: (ms: number) => Promise<void> }
-}
-
-// Stand in for the Mac beneath the mod: uname, `security` over `items`,
-// a tool that "prints" `output`, `sleep` on the test's clock.
-function mac(on: any, opts: Opts = {}) {
-  on('process.run', async (_$: unknown, e: { argv: string[] }) => {
-    opts.argvs?.push([...e.argv])
-    opts.log?.push(`process.run ${e.argv.slice(0, 2).join(' ')}`)
-    const answer = (r: { exitCode: number; stdout: string; stderr: string }) => ({
-      value: { isStdoutTruncated: false, isStderrTruncated: Boolean(opts.truncated), ...r },
-    })
-    if (e.argv[0] === '/usr/bin/uname' || e.argv[0] === '/bin/uname') {
-      const runs = opts.uname === 'none' ? false : opts.uname === 'bin-only' ? e.argv[0] === '/bin/uname' : true
-      return runs ? answer({ exitCode: 0, stdout: `${opts.platform ?? 'Darwin'}\n`, stderr: '' }) : { deny: `${e.argv[0]} failed to start: ENOENT` }
-    }
-    if (e.argv[0] === 'sleep') await opts.clock?.sleep(300)
-    if (e.argv[0] !== SECURITY) return answer({ exitCode: 0, stdout: '', stderr: '' })
-    if (opts.deny) return { deny: opts.deny }
-    if (opts.fail) return answer(opts.fail)
-    if (e.argv[1] === 'add-generic-password') return answer({ exitCode: 0, stdout: '', stderr: '' })
-    return answer(security(opts.items ?? [], e.argv))
-  })
-  on('tool.call', (_$: unknown, e: Record<string, unknown>) => {
-    opts.seen?.push({ ...e })
-    opts.log?.push(`tool ${String(e.tool)}`)
-    const out = opts.output
-    return { result: typeof out === 'function' ? out(String(e.command ?? '')) : out ?? 'ran' }
-  })
-  on('session.cwd', () => ({ value: '/repo' }))
-  on('fs.exists', (_$: unknown, e: { path: string }) => {
-    if (e.path !== MACOS_VERSION_FILE) return { value: false }
-    return opts.versionFile === 'fails' ? { deny: 'not allowed' } : { value: opts.versionFile === 'present' }
-  })
-  on('fs.write', (_$: unknown, e: { path: string; text: string }) => {
-    opts.writes?.push({ path: e.path, text: e.text })
-    return { value: undefined }
-  })
-  on('ui.toast', (_$: unknown, e: { text: string }) => {
-    opts.toasts?.push(String(e.text))
-    return { value: undefined }
-  })
-  on('session.surfaces', () => ({ value: ['terminal'] }))
-  on('ui.open', (_$: unknown, e: { id: string }) => {
-    opts.opened?.push(e.id)
-    return { value: { isPlaced: true } }
-  })
-  on('ui.close', () => ({ value: undefined }))
-  mock.env(on, opts.env ?? { USER: 'tester', HOME })
-}
-
-const securityCalls = (argvs: string[][]) => argvs.filter((a) => a[0] === SECURITY)
 
 // use_secret's tag for `service`, then what a Write of that tag hands the tool
 async function restored($: any, seen: Record<string, unknown>[], input: Record<string, unknown>) {
@@ -562,17 +436,6 @@ const UPSTREAM_DESCRIPTION =
   'or file and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to ' +
   'paste a secret into chat.'
 
-async function registered($: any, on: any, opts: Opts) {
-  const specs: Record<string, any>[] = []
-  mac(on, opts)
-  on('tool.register', (_$: unknown, e: Record<string, any>) => {
-    specs.push(e)
-    return { value: { tool: `mcp__secret-box__${e.name}` } }
-  })
-  on('session.start', () => ({ cwd: '/repo' }))
-  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-  return specs
-}
 
 test('off macOS only request_secret is registered, exactly as upstream', async ($, on) => {
   const specs = await registered($, on, { platform: 'Linux' })
@@ -583,13 +446,13 @@ test('off macOS only request_secret is registered, exactly as upstream', async (
 
 test('on macOS use_secret is registered too, in the prompt', async ($, on) => {
   const specs = await registered($, on, {})
-  expect(specs.map((s) => [s.name, s.isDeferred])).toEqual([['request_secret', false], ['use_secret', false]])
+  expect(specs.map((s) => [s.name, s.isDeferred])).toEqual([['request_secret', false], ['use_secret', false], ['list_key_names', false], ['migrate_env_to_keychain', undefined]])
   expect(specs[0]!.description).toContain('macOS Keychain')
 })
 
 test('on macOS with backend dotenv, use_secret is still registered and the box is upstream', { options: { backend: 'dotenv' } }, async ($, on) => {
   const specs = await registered($, on, {})
-  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
   expect(specs[0]!.description).toBe(UPSTREAM_DESCRIPTION)
 })
 
@@ -616,7 +479,7 @@ test('uname runs by its full path', async ($, on) => {
 
 test('with no /usr/bin/uname, /bin/uname answers', async ($, on) => {
   const specs = await registered($, on, { uname: 'bin-only' })
-  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
 })
 
 test("Windows says so in OS, and uname never runs", async ($, on) => {
@@ -630,7 +493,7 @@ test("Windows says so in OS, and uname never runs", async ($, on) => {
 test("with no uname, macOS's version file says it is a Mac", async ($, on) => {
   const toasts: string[] = []
   const specs = await registered($, on, { uname: 'none', versionFile: 'present', toasts })
-  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
   expect(specs[0]!.description).toContain('macOS Keychain')
   expect(toasts).toEqual([])
 })
@@ -650,7 +513,7 @@ test('with no uname and no macOS version file, backend auto is the upstream box'
 test("when neither uname nor the version file can be checked, use_secret stays on and a toast says why", async ($, on) => {
   const toasts: string[] = []
   const specs = await registered($, on, { uname: 'none', versionFile: 'fails', toasts })
-  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
   expect(toasts.join('\n')).toContain("couldn't tell whether this is a Mac")
 })
 
@@ -692,7 +555,7 @@ test('on macOS the box saves to the Keychain by default, and leaves .env alone',
   const argvs: string[][] = []
   const writes: { path: string; text: string }[] = []
   const r = await fillBox($, on, VALUE, { argvs, writes })
-  expect(securityCalls(argvs)).toEqual([[SECURITY, 'add-generic-password', '-U', '-s', 'STRIPE_SECRET_KEY', '-a', 'tester', '-w', VALUE]])
+  expect(securityCalls(argvs)).toEqual([[SECURITY, 'add-generic-password', '-U', '-s', 'STRIPE_SECRET_KEY', '-a', 'tester', '-j', 'secret-box', '-w', VALUE]])
   expect(writes).toEqual([])
   expect(JSON.stringify(r)).not.toContain(VALUE)
   expect(String(r.result)).toMatch(TAG)

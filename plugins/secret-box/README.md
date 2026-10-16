@@ -86,6 +86,59 @@ Some reads can't be pinned to one item or hidden. By default these run as writte
 - An item another app created may make macOS ask whether `security` can read it. Allow it, or the read fails and Claude is told the item could not be read.
 - A Keychain value under 8 characters is restored into commands, but it can't be hidden where it turns up later. A direct `-w` read of such a value prints it in the clear, into the transcript (the same limit as `.env`).
 
+## .env pointers and keychain-env (macOS)
+
+A `.env` file can name Keychain items instead of holding keys. A pointer is the value `keychain:SERVICE`, or `keychain:SERVICE?account=ACCOUNT`:
+
+```
+# .env: safe to commit, it holds no key
+OPENAI_API_KEY=keychain:openai
+STRIPE_SECRET_KEY=keychain:myapp/STRIPE_SECRET_KEY?account=work
+DATABASE_PASSWORD=keychain:myapp/DATABASE_PASSWORD
+PORT=3000
+```
+
+Pointers are printable ASCII. Percent-encode anything outside `A-Z a-z 0-9 . _ ~ : @ / + , ; = ! * -` (a space is `%20`). Without `?account=`, the first item with that service is used. Add the items by hand with `security add-generic-password -U -s myapp/STRIPE_SECRET_KEY -a work -j secret-box -w` (it prompts for the value), or let Claude ask for them with the box.
+
+Nothing reads a pointer at session start. They are resolved only when needed:
+
+- **`keychain-env`**, a runner in the plugin's `bin/` folder, runs an app with its pointers set: `/path/to/secret-box/bin/keychain-env -- npm start`. It reads `./.env` (or each `--env-file PATH`), reads every pointer from the Keychain with `/usr/bin/security`, exports it, then runs the command in its place. It never prints a value, and it stops before the app starts if a pointer can't be read. Lines that aren't pointers are left to the app's own `.env` loader; most loaders don't override a variable that is already set. When Claude runs it, the mod first reads every pointer the runner will read, so whatever the app prints of them comes back hidden. A runner call the mod can't pin down (a `cd` before it, an `--env-file` from a variable) goes to `refuseUnmaskable`. Claude is given the runner's absolute path in `use_secret` and `list_key_names`.
+- **`use_secret NAME`** accepts a variable name. With no account given, a variable in the project's `.env` files whose value is a pointer names the item, ahead of a service of the same name. If the files point one name at different items, it asks which. With an account given, the name is always a service.
+
+Pointers stay readable. The detector would otherwise take `OPENAI_API_KEY=keychain:openai` for a password, so the mod puts pointer text back wherever it was hidden. A `.env` file whose keys are all pointers may be staged and committed. The commit guard allows it only when the file holds at least one pointer, every secret-named value is a pointer or empty, and the detector finds no key anywhere else in it. Any other `.env` file is refused as before.
+
+Names: a key one project uses gets service `PROJECTDIR/ENV_NAME`. A key shared across projects gets a short name (`openai`). Variants of one key (personal, work) share a service and differ by account. The default account is your login name.
+
+`keychain-env` handles single-line values only. A value `security -w` prints as hex (one with a newline, a tab or a non-ASCII character) is refused; store such a value base64-encoded, as under Keychain backend.
+
+## list_key_names (macOS)
+
+`list_key_names` returns key names only and never fetches or returns any key's value. It lists:
+
+- the pointers in the project's `.env` files (variable, service, account)
+- the Keychain items secret-box saved: the box and `migrate_env_to_keychain` tag each item with the comment `secret-box`
+- the Keychain items whose service starts with one of the `listPrefixes` you set (`myapp/,openai`)
+
+It never lists the whole keychain. It reads the names with `security dump-keychain` (without `-d`, which would include passwords), filters them inside the mod, and never returns the raw output. To make an existing item show up, re-save it with the tag (`security add-generic-password -U -s SERVICE -a ACCOUNT -j secret-box -w`, which prompts for the value again), or set `listPrefixes` to its service's prefix.
+
+## migrate_env_to_keychain (macOS)
+
+`migrate_env_to_keychain` moves plaintext keys from one `.env` file into the Keychain. By default it moves every secret-named entry; give `names` to choose. It works on one entry at a time:
+
+1. It saves the value as service `PROJECTDIR/NAME`, account `$USER` (or `keychainAccount`), tagged for `list_key_names`.
+2. It reads the value back and compares it.
+3. Only then does it rewrite that line as a pointer.
+
+Any failure leaves the line as it was, including an item that already holds a different value, which it never overwrites. It rewrites the file with the mod's own file access, not the Write tool, so no copy of the old values lands in `~/.claude/file-history/`. It writes no backup. It never returns a value.
+
+A tool a mod answers itself gets no approval prompt from Claude Code, so the mod asks you in a dialog before it changes anything. A permission rule that allows or denies `mcp__secret-box__migrate_env_to_keychain` is honored instead.
+
+## How Claude finds all this
+
+Installing the plugin is enough. Once per session, at the first sign of keys in play, the mod adds a short note to what Claude reads, and you don't see it. Those signs are: the session starts in a folder with `.env` files, Claude touches a `.env` file, or a key is hidden from a tool's result. The note says secret-box is installed, gives the pointer syntax and the runner's path, and tells Claude to load the `secret-box:secrets` skill. When a `.env` file holds plaintext keys, it also offers `migrate_env_to_keychain`.
+
+The skill teaches the rules: never ask for a key in chat, find keys with `list_key_names`, use exactly what `use_secret` returns, run apps through `keychain-env`, and write pointers, never values. Run it yourself as `/secret-box:secrets setup` to set up a project: Claude writes the `.env` pointers and hands you one `security add-generic-password … -w` line per missing key, so the values go from your keyboard straight into the Keychain. Run those lines in your own terminal window, not at Claude's prompt with `!`. Claude Code runs `!` commands without terminal input, so `security` can't prompt and saves an empty value.
+
 ## Settings
 
 Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginConfigs` in your user settings.
@@ -94,6 +147,7 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 | :- | :- | :- |
 | `backend` | `auto` | Where the box saves: `auto` (the Keychain on macOS, `.env` elsewhere), `keychain` (macOS only; refused elsewhere rather than falling back to a plaintext file) or `dotenv` (the project `.env`) |
 | `keychainAccount` | empty | The account the box saves Keychain items under. Empty means your macOS user name |
+| `listPrefixes` | empty | macOS: service prefixes, comma separated, whose Keychain items `list_key_names` shows beside the ones secret-box saved |
 | `refuseUnmaskable` | `false` | macOS: refuse a Bash command that reads the Keychain in a way the mod can't pin to one item or hide (listed under Keychain backend), instead of letting it run |
 | `secrets` | `true` | Hide secrets in tool output and prompts |
 | `pii` | `false` | Hide email addresses and public IP addresses |
@@ -147,7 +201,7 @@ claude plugin test .
 node --experimental-strip-types tests/detect.test.mts
 ```
 
-`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms, with a fake `security` that prints what the real one does. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
+`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms. `tests/keychain-v2.test.ts` covers pointers, `keychain-env`'s pre-load, the commit guard, `list_key_names`, `migrate_env_to_keychain` and the once-per-session note. Both use `tests/fake-mac.ts`, a fake `security` that prints what the real one does. `bin/keychain-env` is checked against the real Keychain. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
 
 Tested with Claude Code 2.1.296.
 

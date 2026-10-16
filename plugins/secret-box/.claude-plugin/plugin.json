@@ -22,6 +22,12 @@
       "description": "macOS: refuse a Bash command that reads the Keychain in a way secret-box can't pin to one item or hide (a variable, sudo, dump-keychain, security -i, a value under 8 characters). Off, the command runs and only the detector scans its output",
       "default": false
     },
+    "listPrefixes": {
+      "type": "string",
+      "title": "Keychain services list_key_names may show",
+      "description": "macOS: service-name prefixes, separated by commas (myapp/,openai). list_key_names shows the names of Keychain items whose service starts with one, beside the items secret-box saved. Empty: only those",
+      "default": ""
+    },
     "keychainAccount": {
       "type": "string",
       "title": "Keychain account",

@@ -59,10 +59,14 @@ export function badName(label, value) {
   return ''
 }
 
-// -U updates the item when it is already there. The value sits in argv while
-// the command runs, where `ps` and any mod hooked on process.run can see it.
+// The comment on every item the mod saves, so list_key_names can find them
+export const BOX_COMMENT = 'secret-box'
+
+// -U updates the item when it is already there; -j tags it as the mod's. The
+// value sits in argv while the command runs, where `ps` and any mod hooked on
+// process.run can see it.
 export function addArgv(service, account, value) {
-  return [SECURITY, 'add-generic-password', '-U', '-s', service, '-a', account, '-w', value]
+  return [SECURITY, 'add-generic-password', '-U', '-s', service, '-a', account, '-j', BOX_COMMENT, '-w', value]
 }
 
 // The command you run to add an item by hand. With -w last, `security`
@@ -166,6 +170,96 @@ function utf8(hex) {
   }
 }
 
+// ---------------------------------------------------------------- .env pointers
+
+// A pointer stands in a .env file where a key's value would, and names the
+// Keychain item that holds it: keychain:SERVICE or keychain:SERVICE?account=ACCOUNT.
+// Printable ASCII only; anything outside the plain set is percent-encoded
+// (%20 for a space). bin/keychain-env reads pointers by the same rule.
+const SEG = '(?:[A-Za-z0-9._~:@/+,;=!*-]|%(?:2[0-9A-Fa-f]|[3-6][0-9A-Fa-f]|7[0-9A-Ea-e]))+'
+const POINTER = new RegExp(`^keychain:(${SEG})(?:\\?account=(${SEG}))?$`)
+const unescapePointer = (s) => s.replace(/%([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+const escapePointer = (s) => s.replace(/[^A-Za-z0-9._~:@/+,;=!*-]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))
+
+// { service, account? } for a pointer, undefined for anything else
+export function parsePointer(value) {
+  const m = POINTER.exec(String(value))
+  return m ? { service: unescapePointer(m[1]), ...(m[2] ? { account: unescapePointer(m[2]) } : {}) } : undefined
+}
+
+// The pointer to an item, or undefined when a name holds a character a
+// pointer can't carry (anything but printable ASCII)
+export function pointerTo(service, account) {
+  if (!/^[\x20-\x7e]+$/.test(service) || (account && !/^[\x20-\x7e]+$/.test(account))) return undefined
+  return `keychain:${escapePointer(service)}${account ? `?account=${escapePointer(account)}` : ''}`
+}
+
+// A .env value as dotenv libraries read it: in quotes, the text inside them;
+// bare, the text before a ` #` comment
+export function envValue(raw) {
+  const v = String(raw).trim()
+  const q = /^"([^"]*)"(?:\s+#.*)?$/.exec(v) || /^'([^']*)'(?:\s+#.*)?$/.exec(v)
+  return q ? q[1] : v.replace(/\s+#.*$/, '').trim()
+}
+
+// Each NAME=value line of a .env file, as [name, value]
+export function envAssignments(text) {
+  const out = []
+  for (const line of String(text).split('\n')) {
+    // A CRLF file's \r goes too, as the runner's trim takes it
+    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line.replace(/\r$/, ''))
+    if (m) out.push([m[1], envValue(m[2])])
+  }
+  return out
+}
+
+// The pointers in a .env file, as [name, { service, account? }]
+export function envPointers(text) {
+  return envAssignments(text).flatMap(([name, value]) => {
+    const pointer = parsePointer(value)
+    return pointer ? [[name, pointer]] : []
+  })
+}
+
+// --------------------------------------------------------------- listing names
+
+// The generic passwords in `security dump-keychain` output. Without -d it
+// prints attributes only, never a password. Each item gives its service,
+// account, label and comment. An attribute is "text", or 0xHEX and an escaped
+// copy when it holds a byte that isn't printable, or <NULL>.
+export function dumpedItems(text) {
+  const items = []
+  let item
+  for (const line of String(text).split('\n')) {
+    if (line.startsWith('keychain: ')) items.push((item = {}))
+    else if (item && line.startsWith('class: ')) item.class = attribute(line.slice('class: '.length))
+    else if (item) {
+      // `    "acct"<blob>="..."`, and the label as `    0x00000007 <blob>="..."`
+      const m = /^\s+(?:"(\w{4})"|0x(00000007) )<\w+>=(.*)$/.exec(line)
+      // 0x00000007 is the label (the item's name in Keychain Access)
+      if (m) item[m[1] || 'labl'] = attribute(m[3])
+    }
+  }
+  return items
+    .filter((i) => i.class === 'genp' && i.svce)
+    .map((i) => ({ service: i.svce, account: i.acct ?? '', label: i.labl ?? '', comment: i.icmt ?? '' }))
+}
+
+function attribute(raw) {
+  const q = /^"(.*)"$/.exec(raw)
+  if (q) return q[1]
+  const h = /^0x((?:[0-9A-Fa-f]{2})*)(?: {2}".*")?$/.exec(raw)
+  return h ? utf8(h[1]) : undefined
+}
+
+// The generic passwords in the keychain search list, names only: the dump is
+// read here and never handed on
+export async function keychainItems($) {
+  const r = await run($, [SECURITY, 'dump-keychain'])
+  if (r.exitCode !== 0) throw new Error(`security exited ${r.exitCode}`)
+  return { items: dumpedItems(r.stdout), isCut: Boolean(r.isStdoutTruncated) }
+}
+
 // ---------------------------------------------- Keychain reads in a Bash command
 
 // The variables a read may name that the hook can know. $.env only reads
@@ -176,14 +270,31 @@ export const READ_ENV = ['USER', 'LOGNAME', 'HOME']
 // take none; any other flag (-h) is one we don't follow.
 const MATCH = { generic: 'acCDGjls', internet: 'acCdDjlpPrst' }
 const READS = ['find-generic-password', 'find-internet-password']
-const MENTION = /find-(?:generic|internet)-password|dump-keychain/g
+const MENTION = /find-(?:generic|internet)-password|dump-keychain|keychain-env/g
+const unknown = (why) => ({ unknown: why })
+const unknowable = unknown('a word in it is only known when it runs')
 
-// The Keychain reads a Bash command makes, each a read for readKeychain, or
+// The runner, by name or by any path to it
+const RUNNER = 'keychain-env'
+const isRunner = (w) => typeof w === 'string' && (w === RUNNER || w.endsWith('/' + RUNNER))
+// Commands that run the command they are given, so a runner after one is run
+const WRAPPERS = ['sudo', 'env', 'exec', 'command', 'nohup', 'nice', 'xargs', 'bash', 'sh', 'zsh']
+
+// A keyword that starts a command inside if, for or while is not the command
+const command = (words) => {
+  let k = 0
+  while (['do', 'then', 'else', 'elif', '!', 'time'].includes(words[k])) k++
+  return words.slice(k)
+}
+
+// The Keychain reads a Bash command makes, each a read for readKeychain, a
+// runner's { envFiles } (the .env files bin/keychain-env will resolve), or
 // { unknown: why } where we can't know exactly which item it reads or what it
 // prints: a word only the shell can know ($VAR, a glob, $(...)), a prefix
 // (sudo, env, VAR=x) that could change whose Keychain it reads, a relative
-// keychain file, `security -i` or `dump-keychain`, or a read that isn't a
-// command of its own (inside quotes for `sh -c`). `env` holds READ_ENV's values.
+// keychain file, `security -i` or `dump-keychain`, a runner whose .env can't
+// be known, or a read that isn't a command of its own (inside quotes for
+// `sh -c`). `env` holds READ_ENV's values.
 export function keychainReads(cmd, env = {}) {
   const text = String(cmd || '')
   const ctx = { text, env, commands: [], comments: [] }
@@ -192,9 +303,8 @@ export function keychainReads(cmd, env = {}) {
   const add = (read) => reads.set(JSON.stringify(read), read)
   let seen = 0
   for (const words of ctx.commands) {
-    seen += words.filter((w) => READS.includes(w) || w === 'dump-keychain').length
-    const read = readOf(words)
-    if (read) add(read)
+    seen += words.filter((w) => READS.includes(w) || w === 'dump-keychain' || isRunner(w)).length
+    for (const read of commandReads(words)) add(read)
   }
   // A mention outside a comment that isn't a word of its own: inside quotes, or glued to others
   let code = ''
@@ -204,8 +314,45 @@ export function keychainReads(cmd, env = {}) {
     from = end
   }
   code += text.slice(from)
-  if ((code.match(MENTION) || []).length > seen) add({ unknown: 'part of it could not be parsed' })
+  if ((code.match(MENTION) || []).length > seen) add(unknown('part of it could not be parsed'))
+  // The runner reads ./.env from the shell's folder: a cd before it moves that
+  if (ctx.commands.some((w) => ['cd', 'pushd', 'popd'].includes(command(w)[0]))) {
+    for (const [key, read] of reads) {
+      if (read.envFiles) {
+        reads.delete(key)
+        add(unknown('it changes folder, so which .env keychain-env reads is unknown'))
+      }
+    }
+  }
   return [...reads.values()]
+}
+
+// What one simple command reads: the runner's .env files and the command it
+// runs, or the command's own read
+function commandReads(all) {
+  const words = command(all)
+  if (isRunner(words[0])) return runnerReads(words.slice(1))
+  if (words.slice(1).some(isRunner) && (words[0] === null || WRAPPERS.includes(String(words[0]).split('/').pop()))) {
+    return [unknown('something runs keychain-env in a way secret-box can\'t follow')]
+  }
+  const read = readOf(words)
+  return read ? [read] : []
+}
+
+// keychain-env [--env-file PATH]... -- COMMAND: the .env files it resolves
+// (./.env when none is named), then whatever COMMAND reads in turn. Anything
+// else is what the runner itself refuses.
+function runnerReads(args) {
+  const envFiles = []
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k]
+    if (a === null) return [unknowable]
+    if (a === '--') return [{ envFiles: envFiles.length ? envFiles : ['.env'] }, ...commandReads(args.slice(k + 1))]
+    if (a === '--env-file' && typeof args[k + 1] === 'string') envFiles.push(args[++k])
+    else if (a.startsWith('--env-file=')) envFiles.push(a.slice('--env-file='.length))
+    else return [a === '--env-file' ? unknowable : unknown(`keychain-env is given ${a}`)]
+  }
+  return [unknown('keychain-env is run without --')]
 }
 
 // What one simple command reads from the Keychain: nothing (undefined), a
@@ -213,12 +360,7 @@ export function keychainReads(cmd, env = {}) {
 // find-*-password [options] [keychain...]`, its options read as getopt does:
 // bundled (`-wa NAME`), attached (`-sNAME`), and ended by the first word that
 // is not one, which starts the keychain files.
-function readOf(command) {
-  // A keyword that starts a command inside if, for or while is not the command
-  let words = command
-  while (['do', 'then', 'else', 'elif', '!', 'time'].includes(words[0])) words = words.slice(1)
-  const unknown = (why) => ({ unknown: why })
-  const unknowable = unknown('a word in it is only known when it runs')
+function readOf(words) {
   const at = words.findIndex((w) => READS.includes(w) || w === 'dump-keychain')
   const runsSecurity = typeof words[0] === 'string' && /(?:^|\/)security$/.test(words[0])
   if (at < 0 && !runsSecurity) return undefined
