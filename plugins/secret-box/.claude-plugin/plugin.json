@@ -70,6 +70,12 @@
       "description": "Tools that run on this machine and may receive the real value behind a placeholder, separated by commas. Never list a tool that sends its input to another model or the network (Agent, WebFetch, WebSearch)",
       "default": "Bash,Write,Edit,MultiEdit,NotebookEdit"
     },
+    "ownApproval": {
+      "type": "boolean",
+      "title": "Approve calls with real values itself",
+      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders: your permission rules first, then secret-box's own Allow/Deny prompt. It never allows a call on its own. Off, Claude Code asks about the call with the real values in it, as before",
+      "default": true
+    },
     "notify": {
       "type": "boolean",
       "title": "Say when something is hidden",

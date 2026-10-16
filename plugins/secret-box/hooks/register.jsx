@@ -11,14 +11,17 @@
 //     runs, so `curl -H "Authorization: Bearer [REDACTED-SECRET-...]"` works.
 //   - Never: committing .env is refused, since a pushed key can't be taken back.
 //
-// The redaction is transcript-redactor, unchanged (./redact.ts, ./detect.ts):
-// its hooks do the In, Out and Use. This file adds the box, use_secret,
+// The redaction is transcript-redactor (./redact.ts, ./detect.ts): its hooks
+// do the In, Out and Use. redact.ts adds one thing: a call it filled with real
+// values gets its permission check answered on the call as Claude wrote it
+// (ownApproval), so the key never reaches the dialog or the auto-mode
+// classifier. This file adds the box, use_secret,
 // list_key_names and migrate_env_to_keychain, keeps .env pointers readable,
 // teaches the vault the values in .env and the Keychain items a command (or
 // bin/keychain-env) reads, and guards commits. Nothing is written but Keychain
 // items and .env.
 
-import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
+import { register as redactor, LIVE_TAG_TOOLS, brand, tagNames } from './redact.ts'
 import { collect, keepSecret, makeConfig, restore, scrubSecrets, walk } from './detect.ts'
 import {
   addHint, badName, BOX_COMMENT, boxBackend, defaultAccount, envAssignments, envPointers, envValue, keychainItems, keychainReads,
@@ -89,11 +92,19 @@ function runnerPath($) {
 
 // Every value this file hands the vault. The vault can't be asked what it
 // holds, and values under 8 characters aren't indexed for the scrubber to
-// find, so isCleanPointer checks against this set too.
+// find, so isCleanPointer checks against this set too. `name` says what the
+// value is (a Keychain item, a .env variable) in the approval prompt.
 const keptValues = new Set()
-function keep(value) {
+function keep(value, name) {
   keptValues.add(value)
-  return keepSecret(value)
+  const tag = keepSecret(value)
+  if (name) tagNames.set(tag, name)
+  return tag
+}
+
+// How the approval prompt names a Keychain item
+function itemName(service, account) {
+  return `the Keychain item ${service}${account ? ` (account ${account})` : ''}`
 }
 
 // A pointer that is only a pointer: its service and account each pass the
@@ -224,7 +235,7 @@ async function preloadRunner($, envFiles) {
     }
     for (const [, pointer] of envPointers(text)) {
       const got = await readKeychain($, serviceRead(pointer.service, pointer.account))
-      for (const shown of got.printed || []) keep(shown)
+      for (const shown of got.printed || []) keep(shown, itemName(pointer.service, pointer.account))
       if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) return `security could not read ${pointer.service} (exit ${got.exitCode})`
       if ((got.printed || []).some((p) => p.length < MIN_HIDDEN)) return `the value of ${pointer.service} is too short to be hidden`
     }
@@ -347,7 +358,7 @@ async function migrateEnv($, e, options) {
         leftAsIs.push(`${p.name} (the Keychain did not read back the same value)`)
         continue
       }
-      for (const shown of after.printed) keep(shown)
+      for (const shown of after.printed) keep(shown, itemName(service, account))
       lines[p.i] = `${p.head}${pointer}${p.eol}`
       moved.push(`  ${p.name}=${pointer}`)
     } catch (err) {
@@ -562,7 +573,8 @@ export function register(on, options) {
       } else if (!why) {
         try {
           const got = await readKeychain($, read)
-          for (const shown of got.printed || []) keep(shown)
+          const service = (read.criteria || []).find(([flag]) => flag === '-s')
+          for (const shown of got.printed || []) keep(shown, service ? itemName(service[1]) : undefined)
           // No such item: the command finds none either. Locked or refused: it might still print it
           if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) why = `security could not read the item (exit ${got.exitCode})`
           // The vault can't find a form this short where it turns up
@@ -611,9 +623,9 @@ export function register(on, options) {
       const item = `The Keychain item ${service}${account ? ` (account ${account})` : ''}`
       if (exitCode === undefined) {
         // Every form security prints it in is hidden, should a command print the item itself
-        for (const shown of printed) keep(shown)
+        for (const shown of printed) keep(shown, itemName(service, account))
         if (value) {
-          const tag = keep(value)
+          const tag = keep(value, itemName(service, account))
           // The ONLY things Claude learns: the service, and how to use the value without seeing it
           return { result: `Loaded ${service}${account ? ` (account ${account})` : ''} from the Keychain${via ? via : '.'} ${howToUse(service, account, value, tag)}` }
         }
@@ -712,14 +724,14 @@ export function register(on, options) {
         const why = account ? badName('keychainAccount', account) : 'No Keychain account: set the keychainAccount option.'
         if (why) return { result: `Saving ${name} failed: ${why}` }
         await saveToKeychain($, name, account, value)
-        const tag = keep(value)
+        const tag = keep(value, itemName(name, account))
         const pointer = pointerTo(name, account)
         $.ui.toast(`${name} saved to Keychain`)
         // The ONLY things Claude learns: the name, the place, and a placeholder
         return { result: `The user entered ${name}. It was saved to the macOS Keychain (service ${name}, account ${account}); .env was not touched. ${howToUse(name, account, value, tag)} In a later session, call use_secret with service ${name} and account ${account}.${pointer ? ` For an app that reads .env, write the line ENV_NAME=${pointer} there, never the value, and run the app with ${runnerPath($)} -- COMMAND.` : ''}` }
       }
       const where = await saveToDotenv($, await $.session.cwd(), name, value)
-      const tag = keep(value)
+      const tag = keep(value, `${name} in .env`)
       $.ui.toast(`${name} saved to ${where}`)
       // The ONLY things Claude learns: the name, the place, and a placeholder
       return { result: `The user entered ${name}. It was saved to ${where}. You can't see the value. To use it in a command or a file, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. Code should read it from the environment.` }
@@ -802,7 +814,7 @@ async function learnDotenv($, files) {
       for (const m of (await $.fs.read(path)).matchAll(ASSIGNMENT)) {
         const value = m[3].trim().replace(/^["']|["']$/g, '')
         // A pointer only names a Keychain item: it stays readable
-        if (value.length >= 6 && SECRET_NAME.test(m[2]) && !parsePointer(envValue(m[3]))) keep(value)
+        if (value.length >= 6 && SECRET_NAME.test(m[2]) && !parsePointer(envValue(m[3]))) keep(value, `${m[2]} in ${f}`)
       }
     } catch {}
   }

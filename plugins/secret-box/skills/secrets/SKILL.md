@@ -46,6 +46,15 @@ STRIPE_SECRET_KEY=keychain:myapp/STRIPE_SECRET_KEY?account=work
   `security add-generic-password -U -s SERVICE -a ACCOUNT -j secret-box -w`
   or ask the user to add the item's service prefix to the plugin's `listPrefixes` option.
 
+## Approval and permission rules
+
+- A call that uses a placeholder may need the user's approval. secret-box decides it on the call as written, with placeholders: the user's permission rules first, then its own Allow/Deny dialog. Never put a key's value into a command to get past a check. If the user denies the call, ask them what to do; don't retry it in another form.
+- An app run through `keychain-env` is checked like any other command, and auto mode may refuse it as credential access. Offer the user a narrow allow rule for that exact command, for the project's `.claude/settings.local.json` (machine-specific, since it holds the runner's absolute path). Give them the exact line, with the absolute path from `use_secret` or `list_key_names` filled in:
+  ```json
+  { "permissions": { "allow": ["Bash(/absolute/path/to/bin/keychain-env -- npm start)"] } }
+  ```
+  One rule per exact command. Never propose `keychain-env:*` or any other wildcard rule for the runner: it would let any command run with every key the project's `.env` points to. Let the user add the rule.
+
 ## When to read the other files
 
 - A `.env` file holds a plaintext key (`list_key_names` or a secret-box note says so): read `migrating.md`, then offer `migrate_env_to_keychain`.
