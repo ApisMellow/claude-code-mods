@@ -105,7 +105,19 @@ Nothing reads a pointer at session start. They are resolved only when needed:
 - **`keychain-env`**, a runner in the plugin's `bin/` folder, runs an app with its pointers set: `/path/to/secret-box/bin/keychain-env -- npm start`. It reads `./.env` (or each `--env-file PATH`), reads every pointer from the Keychain with `/usr/bin/security`, exports it, then runs the command in its place. It never prints a value, and it stops before the app starts if a pointer can't be read. Lines that aren't pointers are left to the app's own `.env` loader; most loaders don't override a variable that is already set. When Claude runs it, the mod first reads every pointer the runner will read, so whatever the app prints of them comes back hidden. A runner call the mod can't pin down (a `cd` before it, an `--env-file` from a variable) goes to `refuseUnmaskable`. Claude is given the runner's absolute path in `use_secret` and `list_key_names`.
 - **`use_secret NAME`** accepts a variable name. With no account given, a variable in the project's `.env` files whose value is a pointer names the item, ahead of a service of the same name. If the files point one name at different items, it asks which. With an account given, the name is always a service.
 
-Pointers stay readable. The detector would otherwise take `OPENAI_API_KEY=keychain:openai` for a password, so the mod puts pointer text back wherever it was hidden. A `.env` file whose keys are all pointers may be staged and committed. The commit guard allows it only when the file holds at least one pointer, every secret-named value is a pointer or empty, and the detector finds no key anywhere else in it. Any other `.env` file is refused as before.
+Pointers stay readable. The detector would otherwise take `OPENAI_API_KEY=keychain:openai` for a password, so the mod puts pointer text back wherever it was hidden. A `.env` file whose keys are all pointers may be staged and committed. The commit guard allows it only when all of these hold:
+
+- the file holds at least one pointer
+- the Keychain holds the item each pointer names
+- every secret-named value is a pointer or empty
+- every quote closes on its own line
+- the detector finds no key anywhere else in the file
+
+The guard checks for each item with `security find-generic-password -s SERVICE [-a ACCOUNT]`, attributes only, so no password is read and nothing prompts. A missing item refuses the commit, and so does a check that can't run. Any other `.env` file is refused as before.
+
+Some names can't be told apart from a key: 16 or more hex digits, a UUID, or 20 or more letters and digits mixed with no `/ . - _` or space between them. Datadog, Algolia and Twilio keys and UUID API keys look like this, and the detector leaves those shapes alone on purpose. A pointer whose service or account looks like that is treated as a key: it stays hidden and can't be committed. Name items the usual way instead (`myapp/STRIPE_SECRET_KEY`, `openai`).
+
+A key under 8 characters that the mod never handled itself can't be told from a short service name, so after `keychain:` it shows. Claude can't write a placeholder after `keychain:`; that write is refused.
 
 Names: a key one project uses gets service `PROJECTDIR/ENV_NAME`. A key shared across projects gets a short name (`openai`). Variants of one key (personal, work) share a service and differ by account. The default account is your login name.
 

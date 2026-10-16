@@ -22,7 +22,8 @@ import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
 import { collect, keepSecret, makeConfig, restore, scrubSecrets, walk } from './detect.ts'
 import {
   addHint, badName, BOX_COMMENT, boxBackend, defaultAccount, envAssignments, envPointers, envValue, keychainItems, keychainReads,
-  MIN_HIDDEN, NOT_FOUND, parsePointer, platformOf, pointerTo, quoteCloses, readCommand, readKeychain, saveToKeychain, serviceRead, SHELL_ACTIVE,
+  itemExists, looksLikeKey, MIN_HIDDEN, NOT_FOUND, parsePointer, platformOf, pointerTo, quoteCloses, readCommand, readKeychain, saveToKeychain,
+  serviceRead, SHELL_ACTIVE,
 } from './keychain.js'
 
 const TOOL = 'mcp__secret-box__request_secret'
@@ -96,15 +97,18 @@ function keep(value) {
 }
 
 // A pointer that is only a pointer: its service and account each pass the
-// detector on their own, and hold no placeholder and no value this mod hid.
-// The text a hidden span stands for has any key inside it put back, so a real
-// key written after `keychain:` reads back as `keychain:<key>`. It stays hidden.
+// detector on their own, aren't shaped like a key (hex, a UUID, a long mixed
+// token, which the detector leaves alone), and hold no placeholder and no
+// value this mod hid. The text a hidden span stands for has any key inside it
+// put back, so a real key written after `keychain:` reads back as
+// `keychain:<key>`. It stays hidden.
 function isCleanPointer(value, cfg) {
   const pointer = parsePointer(value)
   if (!pointer) return false
   return [pointer.service, pointer.account ?? ''].every(
     (s) =>
       !s.includes('[REDACTED-') &&
+      !looksLikeKey(s) &&
       ![...keptValues].some((v) => v.length >= 4 && s.includes(v)) &&
       collect(() => scrubSecrets(s, cfg)).tags.size === 0,
   )
@@ -169,10 +173,13 @@ async function projectEnvFiles($) {
   return files.sort((a, b) => (a.name < b.name ? -1 : 1))
 }
 
-// A .env file that may be committed: it holds pointers, each a clean one,
-// every secret-named value is a pointer (or empty), every quote closes on its
-// line, and the detector finds no key in the rest
-function holdsNoKey(text, cfg) {
+// Why a .env file may not be committed, or '' when it may: it holds pointers,
+// each a clean one to an item the Keychain holds, every secret-named value is
+// a pointer (or empty), every quote closes on its line, and the detector finds
+// no key in the rest. Whether the Keychain holds an item is asked once per
+// load (`memo.items` keeps only items found, so one added later is seen); an
+// answer that can't be had refuses, since this is a guard.
+async function keyIn($, text, cfg, memo) {
   let pointers = 0
   const rest = []
   for (const line of String(text).split('\n')) {
@@ -180,16 +187,25 @@ function holdsNoKey(text, cfg) {
     if (assignment) {
       const [name, value, raw] = assignment
       // A quoted value that runs on below its line (a PEM key) can't be judged line by line
-      if (!quoteCloses(raw)) return false
+      if (!quoteCloses(raw)) return `${name} has a quoted value that runs past its line`
       if (isCleanPointer(value, cfg)) {
+        const pointer = parsePointer(value)
+        const key = JSON.stringify([pointer.service, pointer.account ?? ''])
+        if (!memo.items.has(key)) {
+          const exists = await itemExists($, pointer)
+          if (exists === false) return `${name} points to ${value}, which the Keychain doesn't hold`
+          if (exists !== true) return `whether the Keychain holds ${name}'s item (${value}) could not be checked`
+          memo.items.add(key)
+        }
         pointers++
         continue
       }
-      if (value !== '' && SECRET_NAME.test(name)) return false
+      if (value !== '' && SECRET_NAME.test(name)) return `${name} holds a key`
     }
     rest.push(line)
   }
-  return pointers > 0 && collect(() => scrubSecrets(rest.join('\n'), cfg)).tags.size === 0
+  if (pointers === 0) return 'it holds no keychain: pointer'
+  return collect(() => scrubSecrets(rest.join('\n'), cfg)).tags.size === 0 ? '' : 'it holds a key'
 }
 
 // Before bin/keychain-env runs: load every pointer it will resolve, from the
@@ -361,7 +377,7 @@ export function register(on, options) {
   // use_secret, list_key_names, migrate_env_to_keychain and the pre-load are on
   // unless this is known not to be a Mac, and the box saves to the Keychain
   // only on one (unless backend says otherwise)
-  const memo = {}
+  const memo = { items: new Set() }
   const refuse = [true, 'true'].includes((options || {}).refuseUnmaskable)
   // The detector's settings, for the commit guard's own scan of a .env file
   const cfg = makeConfig(options || {})
@@ -501,7 +517,7 @@ export function register(on, options) {
 
   // 2. The guard: .env may be read (its secrets come back hidden), never committed
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const why = await commitBlockReason($, String(e.command || ''), cfg)
+    const why = await commitBlockReason($, String(e.command || ''), cfg, memo)
     return why ? { deny: `secret-box: ${why} A pushed key can't be taken back.` } : next(e)
   }).catch(() => ({ deny: 'secret-box: the .env guard failed, so this call is blocked to be safe.' }))
 
@@ -812,13 +828,16 @@ function gitDirs(cmd) {
 // Why a Bash command must be blocked: it stages or commits a .env file. A
 // .env file of pointers may go in (holdsNoKey): it names Keychain items and
 // holds no key. Any file that can't be read and checked is blocked as before.
-async function commitBlockReason($, cmd, cfg) {
-  const holdsKey = async (read) => {
+async function commitBlockReason($, cmd, cfg, memo) {
+  // Why a .env file can't go in, or '' when it can; one that can't be read can't
+  const keyOf = async (read) => {
+    let text
     try {
-      return !holdsNoKey(await read(), cfg)
+      text = await read()
     } catch {
-      return true
+      return 'it could not be read'
     }
+    return keyIn($, text, cfg, memo)
   }
   if (/\bgit\b[^;&|]*\badd\b/.test(cmd) && /\.env\b(?!\.(example|sample|template|dist))/.test(cmd)) {
     // Only .env files named plainly, in the current folder's repository, can be checked
@@ -826,7 +845,8 @@ async function commitBlockReason($, cmd, cfg) {
     if (/\s-C[\s=]/.test(cmd) || named.length === 0) return 'staging a .env file is blocked.'
     const cwd = await $.session.cwd()
     for (const f of named) {
-      if (await holdsKey(() => $.fs.read(isAbsolute(f) ? f : `${cwd}/${f}`))) return 'staging a .env file is blocked. A .env file can be committed once every key in it is a keychain: pointer.'
+      const why = await keyOf(() => $.fs.read(isAbsolute(f) ? f : `${cwd}/${f}`))
+      if (why) return `staging a .env file is blocked: ${why}. A .env file can be committed once every key in it is a keychain: pointer to an item the Keychain holds.`
     }
   }
   if (!/\bgit\b[^;&|]*\bcommit\b/.test(cmd)) return ''
@@ -849,13 +869,15 @@ async function commitBlockReason($, cmd, cfg) {
         if (r.exitCode !== 0) throw new Error('unreadable')
         return r.stdout
       }
-      if (await holdsKey(staged)) return 'this commit would include a .env file. Unstage it with git rm --cached, or make every key in it a keychain: pointer.'
+      const why = await keyOf(staged)
+      if (why) return `this commit would include ${env}: ${why}. Unstage it with git rm --cached, or make every key in it a keychain: pointer to an item the Keychain holds.`
     }
     // Stageable: the working file. Paths are from the folder git ran in.
     const base = !dir ? await $.session.cwd() : isAbsolute(dir) ? dir : `${await $.session.cwd()}/${dir}`
     for (const env of (tree ? tree.stdout.split('\n') : []).filter(isEnvFile)) {
-      if (await holdsKey(() => $.fs.read(`${base}/${env}`))) {
-        return `this command could stage and commit ${env}. Add it to .gitignore, or stage named files in a separate step.`
+      const why = await keyOf(() => $.fs.read(`${base}/${env}`))
+      if (why) {
+        return `this command could stage and commit ${env}: ${why}. Add it to .gitignore, or stage named files in a separate step.`
       }
     }
   }

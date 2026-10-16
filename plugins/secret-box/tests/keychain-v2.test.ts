@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { dumpedItems, envPointers, envValue, keychainReads, parsePointer, pointerTo, SECURITY } from '../hooks/keychain'
+import { dumpedItems, envPointers, envValue, keychainReads, looksLikeKey, parsePointer, pointerTo, SECURITY } from '../hooks/keychain'
 import { ENV_CASES } from './env-cases'
 import { call, CWD, dumpOf, hex, hexOf, LIST, mac, MIGRATE, registered, securityCalls, TAG, USE, wOutput, type Item, type Opts } from './fake-mac'
 
@@ -279,16 +279,18 @@ for (const [name, command, opts] of [
 // ------------------------------------------------------------- commit guard
 
 const pointersOnly = 'OPENAI_API_KEY=keychain:openai?account=work\nPORT=3000\nDB_PASSWORD=\n'
+// The item those pointers name, so the guard finds it in the Keychain
+const held = (): Item[] => [{ s: 'openai', a: 'work', value: hex(30) }]
 const GUARD: [string, Opts, string, boolean][] = [
-  ['git add of a .env of pointers', { files: { '.env': pointersOnly } }, 'git add .env', false],
+  ['git add of a .env of pointers', { files: { '.env': pointersOnly }, items: held() }, 'git add .env', false],
   ['git add of a .env with a plaintext key', { files: { '.env': `${pointersOnly}STRIPE_SECRET_KEY=${STRIPE}\n` } }, 'git add .env', true],
   ['git add of pointers beside a password in a URL', { files: { '.env': `${pointersOnly}DATABASE_URL=postgres://app:Tr0ub4dor-3-horse@db.internal:5432/app\n` } }, 'git add .env', true],
   ['git add of a .env with no pointer at all', { files: { '.env': 'PORT=3000\n' } }, 'git add .env', true],
   ['git add -C of a .env of pointers', { files: { '.env': pointersOnly } }, 'git -C app add .env', true],
   ['git add of a .env that cannot be read', {}, 'git add .env', true],
-  ['commit of a staged .env of pointers', { git: { index: '.env\n', show: { '.env': pointersOnly } } }, 'git commit -m wip', false],
+  ['commit of a staged .env of pointers', { git: { index: '.env\n', show: { '.env': pointersOnly } }, items: held() }, 'git commit -m wip', false],
   ['commit of a staged .env with a key', { git: { index: '.env\n', show: { '.env': `STRIPE_SECRET_KEY=${STRIPE}\n` } } }, 'git commit -m wip', true],
-  ['commit -a of a changed .env of pointers', { files: { '.env': pointersOnly }, git: { tree: '.env\n' } }, 'git commit -am wip', false],
+  ['commit -a of a changed .env of pointers', { files: { '.env': pointersOnly }, git: { tree: '.env\n' }, items: held() }, 'git commit -am wip', false],
   ['commit -a of a changed .env with a key', { files: { '.env': `STRIPE_SECRET_KEY=${STRIPE}\n` }, git: { tree: '.env\n' } }, 'git commit -am wip', true],
   ['commit -a when the staged copy has pointers but the file has a key', { files: { '.env': `STRIPE_SECRET_KEY=${STRIPE}\n` }, git: { index: '.env\n', tree: '.env\n', show: { '.env': pointersOnly } } }, 'git commit -am wip', true],
 ]
@@ -553,4 +555,77 @@ test('migrate: a value with backslash escapes stays as it was', async ($, on) =>
   expect(r).toContain('Nothing was changed')
   expect(opts.files!['.env']).toBe(text)
   expect(securityCalls(opts.argvs!)).toEqual([])
+})
+
+// --------------------------- key-shaped names after keychain: (the detector's blind spot)
+
+// Built at run time: hex of the lengths API keys come in, and a UUID
+const UUID = [hex(54).slice(0, 8), hex(55).slice(0, 4), hex(56).slice(0, 4), hex(57).slice(0, 4), hex(58).slice(0, 12)].join('-')
+const KEY_SHAPES = [hex(50).slice(0, 16), hex(51).slice(0, 32), hex(52).slice(0, 40), UUID, 'Ab12Cd34Ef56Gh78Ij90Kl', `myapp/${hex(53).slice(0, 32)}`, `acme.prod/${UUID}`]
+const NAMES = [
+  'openai', 'myapp/STRIPE_SECRET_KEY', 'my-app/STRIPE_SECRET_KEY', 'acme.prod/DB_PASSWORD', 'secret-box-test-proj/DB_PASSWORD',
+  'PROJECTDIR/ENV_NAME', 'repo/AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'david', 'work', 'ops@acme', 'john.smith2024',
+  'deadbeef', 'project2024backup', 'my app/KEY',
+]
+
+test('looksLikeKey: hex, UUIDs and long mixed tokens are keys; names made by the conventions are not', async () => {
+  expect(KEY_SHAPES.filter((s) => !looksLikeKey(s))).toEqual([])
+  expect(NAMES.filter((s) => looksLikeKey(s))).toEqual([])
+})
+
+for (const [name, line] of [
+  ['32 hex', `STRIPE_SECRET_KEY=keychain:${hex(51).slice(0, 32)}`],
+  ['40 hex', `DD_API_KEY=keychain:${hex(52).slice(0, 40)}`],
+  ['a UUID', `CLIENT_SECRET=keychain:${UUID}`],
+  ['a UUID as the account', `CLIENT_SECRET=keychain:svc?account=${UUID}`],
+]) {
+  test(`a fresh session keeps a pointer to ${name} hidden: it is the key's shape, not a name`, async ($, on) => {
+    const text = `${line}\nDB_PASSWORD=keychain:myapp/DB_PASSWORD\n`
+    mac(on, { files: { '.env': text }, output: text })
+    const r = String((await call($, { tool: 'Read', file_path: `${CWD}/.env` })).result)
+    expect(r).not.toContain(line.split('keychain:')[1]!.replace(/^svc\?account=/, ''))
+    expect(r).toContain('DB_PASSWORD=keychain:myapp/DB_PASSWORD')
+  })
+}
+
+test('commit guard: API_TOKEN=keychain:<uuid> is blocked though the detector leaves the line alone', async ($, on) => {
+  mac(on, { files: { '.env': `API_TOKEN=keychain:${UUID}\nOTHER=keychain:openai?account=work\n` }, items: [...held(), { s: UUID, value: hex(32) }] })
+  expect(String((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toContain('API_TOKEN holds a key')
+})
+
+test('commit guard: a pointer to a key-shaped name is blocked even when that item exists', async ($, on) => {
+  const service = hex(51).slice(0, 32)
+  mac(on, { files: { '.env': `STRIPE_SECRET_KEY=keychain:${service}\n` }, items: [{ s: service, value: hex(31) }] })
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toBe(true)
+})
+
+test('commit guard: a pointer to an item the Keychain does not hold is blocked, and says so', async ($, on) => {
+  mac(on, { files: { '.env': 'OPENAI_API_KEY=keychain:openai?account=work\n' } })
+  expect(String((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toContain("points to keychain:openai?account=work, which the Keychain doesn't hold")
+})
+
+for (const [name, opts] of [
+  ['security fails', { fail: { exitCode: 51, stdout: '', stderr: 'denied' } }],
+  ['security cannot run', { deny: 'timed out' }],
+] as [string, Opts][]) {
+  test(`commit guard: when ${name}, whether the item exists is unknown, and the commit is blocked`, async ($, on) => {
+    mac(on, { ...opts, files: { '.env': 'OPENAI_API_KEY=keychain:openai?account=work\n' }, items: held() })
+    expect(String((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toContain('could not be checked')
+  })
+}
+
+test('commit guard: the item is looked up by attributes only, never its password, and once per session', async ($, on) => {
+  const argvs: string[][] = []
+  mac(on, { files: { '.env': pointersOnly }, items: held(), argvs })
+  expect((await call($, { tool: 'Bash', command: 'git add .env' })).deny).toBeUndefined()
+  expect((await call($, { tool: 'Bash', command: 'git add .env' })).deny).toBeUndefined()
+  expect(securityCalls(argvs)).toEqual([[SECURITY, 'find-generic-password', '-s', 'openai', '-a', 'work']])
+})
+
+test('commit guard: an item added after a refusal is found on the next try', async ($, on) => {
+  const opts: Opts = { files: { '.env': pointersOnly } }
+  mac(on, opts)
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toBe(true)
+  opts.items!.push(...held())
+  expect((await call($, { tool: 'Bash', command: 'git add .env' })).deny).toBeUndefined()
 })

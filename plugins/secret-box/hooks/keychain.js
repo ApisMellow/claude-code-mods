@@ -187,6 +187,30 @@ export function parsePointer(value) {
   return m ? { service: unescapePointer(m[1]), ...(m[2] ? { account: unescapePointer(m[2]) } : {}) } : undefined
 }
 
+// A service or account shaped like a key, which the detector leaves alone on
+// purpose (it could be a hash or an id): 16+ hex digits, a UUID, or 20+
+// letters and digits mixed with no / . - _ or space between them. Datadog,
+// Algolia and Twilio keys and UUID API keys look like this; names made the
+// usual way (myapp/STRIPE_SECRET_KEY, openai, acme.prod/DB_PASSWORD, a login
+// name) don't.
+export function looksLikeKey(name) {
+  const s = String(name)
+  if (/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.test(s)) return true
+  return s.split(/[/._\- ]+/).some((run) => /^[0-9a-fA-F]{16,}$/.test(run) || (run.length >= 20 && /[A-Za-z]/.test(run) && /[0-9]/.test(run)))
+}
+
+// Whether the Keychain holds the item a pointer names: true, false (security
+// exits 44), or undefined when that can't be told. Attributes only, no -g or
+// -w, so no password is read and nothing prompts; what it prints stays here.
+export async function itemExists($, { service, account }) {
+  try {
+    const r = await $.process.run([SECURITY, 'find-generic-password', '-s', service, ...(account ? ['-a', account] : [])])
+    return r.exitCode === 0 ? true : r.exitCode === NOT_FOUND ? false : undefined
+  } catch {
+    return undefined
+  }
+}
+
 // The pointer to an item, or undefined when a name holds a character a
 // pointer can't carry (anything but printable ASCII)
 export function pointerTo(service, account) {
