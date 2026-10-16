@@ -22,7 +22,7 @@ import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
 import { collect, keepSecret, makeConfig, restore, scrubSecrets, walk } from './detect.ts'
 import {
   addHint, badName, BOX_COMMENT, boxBackend, defaultAccount, envAssignments, envPointers, envValue, keychainItems, keychainReads,
-  MIN_HIDDEN, NOT_FOUND, parsePointer, platformOf, pointerTo, readCommand, readKeychain, saveToKeychain, serviceRead, SHELL_ACTIVE,
+  MIN_HIDDEN, NOT_FOUND, parsePointer, platformOf, pointerTo, quoteCloses, readCommand, readKeychain, saveToKeychain, serviceRead, SHELL_ACTIVE,
 } from './keychain.js'
 
 const TOOL = 'mcp__secret-box__request_secret'
@@ -86,18 +86,42 @@ function runnerPath($) {
   return `${$.plugin.root}/bin/keychain-env`
 }
 
+// Every value this file hands the vault. The vault can't be asked what it
+// holds, and values under 8 characters aren't indexed for the scrubber to
+// find, so isCleanPointer checks against this set too.
+const keptValues = new Set()
+function keep(value) {
+  keptValues.add(value)
+  return keepSecret(value)
+}
+
+// A pointer that is only a pointer: its service and account each pass the
+// detector on their own, and hold no placeholder and no value this mod hid.
+// The text a hidden span stands for has any key inside it put back, so a real
+// key written after `keychain:` reads back as `keychain:<key>`. It stays hidden.
+function isCleanPointer(value, cfg) {
+  const pointer = parsePointer(value)
+  if (!pointer) return false
+  return [pointer.service, pointer.account ?? ''].every(
+    (s) =>
+      !s.includes('[REDACTED-') &&
+      ![...keptValues].some((v) => v.length >= 4 && s.includes(v)) &&
+      collect(() => scrubSecrets(s, cfg)).tags.size === 0,
+  )
+}
+
 // The detector takes the value of `OPENAI_API_KEY=keychain:openai` for a
 // password and hides it. A pointer only names a Keychain item, so a
-// placeholder that stands for one is put back as the pointer text.
+// placeholder that stands for a clean one is put back as the pointer text.
 const SECRET_TAG = /\[REDACTED-SECRET-[0-9a-f]{8}\]/g
-function showPointers(r) {
+function showPointers(r, cfg) {
   let changed = false
   const show = (text) =>
     typeof text !== 'string' || !text.includes('[REDACTED-SECRET-')
       ? text
       : text.replace(SECRET_TAG, (tag) => {
           const value = restore(tag)
-          if (value === tag || !parsePointer(value)) return tag
+          if (value === tag || !isCleanPointer(value, cfg)) return tag
           changed = true
           return value
         })
@@ -145,18 +169,24 @@ async function projectEnvFiles($) {
   return files.sort((a, b) => (a.name < b.name ? -1 : 1))
 }
 
-// A .env file that may be committed: it holds pointers, every secret-named
-// value is a pointer (or empty), and the detector finds no key in the rest
+// A .env file that may be committed: it holds pointers, each a clean one,
+// every secret-named value is a pointer (or empty), every quote closes on its
+// line, and the detector finds no key in the rest
 function holdsNoKey(text, cfg) {
   let pointers = 0
   const rest = []
   for (const line of String(text).split('\n')) {
     const [assignment] = envAssignments(line)
-    if (assignment && parsePointer(assignment[1])) {
-      pointers++
-      continue
+    if (assignment) {
+      const [name, value, raw] = assignment
+      // A quoted value that runs on below its line (a PEM key) can't be judged line by line
+      if (!quoteCloses(raw)) return false
+      if (isCleanPointer(value, cfg)) {
+        pointers++
+        continue
+      }
+      if (value !== '' && SECRET_NAME.test(name)) return false
     }
-    if (assignment && assignment[1] !== '' && SECRET_NAME.test(assignment[0])) return false
     rest.push(line)
   }
   return pointers > 0 && collect(() => scrubSecrets(rest.join('\n'), cfg)).tags.size === 0
@@ -178,7 +208,7 @@ async function preloadRunner($, envFiles) {
     }
     for (const [, pointer] of envPointers(text)) {
       const got = await readKeychain($, serviceRead(pointer.service, pointer.account))
-      for (const shown of got.printed || []) keepSecret(shown)
+      for (const shown of got.printed || []) keep(shown)
       if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) return `security could not read ${pointer.service} (exit ${got.exitCode})`
       if ((got.printed || []).some((p) => p.length < MIN_HIDDEN)) return `the value of ${pointer.service} is too short to be hidden`
     }
@@ -240,17 +270,27 @@ async function migrateEnv($, e, options) {
   const wanted = Array.isArray(e.names) && e.names.length ? e.names.map(String) : undefined
   const lines = text.split('\n')
   const plan = []
+  const leftAsIs = []
   for (const [i, line] of lines.entries()) {
     const eol = line.endsWith('\r') ? '\r' : ''
-    const m = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=)\s*(.*)$/.exec(eol ? line.slice(0, -1) : line)
+    const m = /^([ \t\r\v\f]*(?:export[ \t\r\v\f]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t\r\v\f]*=)[ \t\r\v\f]*([^\n]*)$/.exec(eol ? line.slice(0, -1) : line)
     if (!m) continue
     const value = envValue(m[3])
     if (value === '' || parsePointer(value) || !(wanted ? wanted.includes(m[2]) : SECRET_NAME.test(m[2]))) continue
+    // A quote that closes below its line (a PEM key) or a backslash escape
+    // (`"a\nb"`): this line alone is not the value, so it stays as it is
+    if (!quoteCloses(m[3]) || value.includes('\\')) {
+      leftAsIs.push(`${m[2]} (its value spans lines or holds backslash escapes: store it base64-encoded, as the secret-box skill's multi-line-values.md describes)`)
+      continue
+    }
     plan.push({ i, name: m[2], value, head: m[1], eol })
   }
-  const missing = (wanted || []).filter((n) => !plan.some((p) => p.name === n))
+  const missing = (wanted || []).filter((n) => !plan.some((p) => p.name === n) && !leftAsIs.some((k) => k.startsWith(`${n} `)))
   const notFound = missing.length ? ` Not found with a plaintext value: ${missing.join(', ')}.` : ''
-  if (plan.length === 0) return `${file} has no ${wanted ? 'such entries' : 'secret-named entries'} with a plaintext value. Nothing was changed.${notFound}`
+  if (plan.length === 0) {
+    const why = leftAsIs.length ? `Left as they were: ${leftAsIs.join('; ')}.` : `${file} has no ${wanted ? 'such entries' : 'secret-named entries'} with a plaintext value.`
+    return `${why} Nothing was changed.${notFound}`
+  }
   const names = plan.map((p) => p.name).join(', ')
 
   let decision = 'ask'
@@ -268,35 +308,34 @@ async function migrateEnv($, e, options) {
   // PROJECTDIR/ENV_NAME, the folder that holds the .env file
   const folder = path.split('/').slice(-2, -1)[0] || 'project'
   const moved = []
-  const kept = []
   for (const p of plan) {
     const service = `${folder}/${p.name}`
     const pointer = pointerTo(service, account)
     if (!pointer) {
-      kept.push(`${p.name} (the folder or account name holds a character a pointer can't carry)`)
+      leftAsIs.push(`${p.name} (the folder or account name holds a character a pointer can't carry)`)
       continue
     }
     try {
       const before = await readKeychain($, serviceRead(service, account))
       if (before.exitCode === undefined && before.value !== p.value) {
-        kept.push(`${p.name} (the Keychain already holds a different value for ${service})`)
+        leftAsIs.push(`${p.name} (the Keychain already holds a different value for ${service})`)
         continue
       }
       if (before.exitCode !== undefined && before.exitCode !== NOT_FOUND) {
-        kept.push(`${p.name} (security exited ${before.exitCode})`)
+        leftAsIs.push(`${p.name} (security exited ${before.exitCode})`)
         continue
       }
       if (before.exitCode === NOT_FOUND) await saveToKeychain($, service, account, p.value)
       const after = await readKeychain($, serviceRead(service, account))
       if (after.exitCode !== undefined || after.value !== p.value) {
-        kept.push(`${p.name} (the Keychain did not read back the same value)`)
+        leftAsIs.push(`${p.name} (the Keychain did not read back the same value)`)
         continue
       }
-      for (const shown of after.printed) keepSecret(shown)
+      for (const shown of after.printed) keep(shown)
       lines[p.i] = `${p.head}${pointer}${p.eol}`
       moved.push(`  ${p.name}=${pointer}`)
     } catch (err) {
-      kept.push(`${p.name} (${String((err && err.message) || err).slice(0, 100)})`)
+      leftAsIs.push(`${p.name} (${String((err && err.message) || err).slice(0, 100)})`)
     }
   }
   if (moved.length) {
@@ -309,7 +348,7 @@ async function migrateEnv($, e, options) {
   return [
     moved.length ? `Moved into the Keychain (account ${account}); these lines of ${file} are now pointers:` : `Nothing in ${file} was changed.`,
     ...moved,
-    ...(kept.length ? [`Left as they were: ${kept.join('; ')}.`] : []),
+    ...(leftAsIs.length ? [`Left as they were: ${leftAsIs.join('; ')}.`] : []),
     ...(moved.length ? [`Run the app with ${runnerPath($)} -- COMMAND so the pointers are set from the Keychain.`] : []),
   ].join('\n') + notFound
 }
@@ -335,7 +374,16 @@ export function register(on, options) {
   //    it hid are put back, and the nudge rides along when its moment comes.
   //    (A match-all matcher: the redactor holds the bare registration.)
   on('tool.call', { tool: /^/ }, async ($, e, next) => {
-    const r = showPointers(await next(e))
+    // `keychain:[REDACTED-SECRET-…]` would be restored into the key itself,
+    // written where a service name belongs
+    if (cfg.restore && cfg.restoreTools.has(e.tool) && /keychain:\[REDACTED-SECRET-[0-9a-f]{8}\]/.test(JSON.stringify(e))) {
+      return {
+        deny:
+          'secret-box: a .env pointer names a Keychain item: after keychain: write its service name (keychain:openai, ' +
+          'keychain:myapp/STRIPE_SECRET_KEY), never a placeholder, which would put the key itself in its place.',
+      }
+    }
+    const r = showPointers(await next(e), cfg)
     if (once.isNudged || r.deny !== undefined || (await platformIn($, memo)) === 'other') return r
     const input = JSON.stringify(e)
     const hidKey = !LIVE_TAG_TOOLS.has(e.tool) && (JSON.stringify([r.result, r.text]).match(SECRET_TAG) || []).some((t) => !input.includes(t))
@@ -347,7 +395,7 @@ export function register(on, options) {
   on('prompt.attachment', { type: /^/ }, async ($, e, next) => {
     const r = await next(e)
     if (typeof r.text !== 'string') return r
-    const shown = showPointers({ result: r.text })
+    const shown = showPointers({ result: r.text }, cfg)
     return shown.result === r.text ? r : { text: shown.result }
   }).catch(($, e, next) => next(e))
 
@@ -498,7 +546,7 @@ export function register(on, options) {
       } else if (!why) {
         try {
           const got = await readKeychain($, read)
-          for (const shown of got.printed || []) keepSecret(shown)
+          for (const shown of got.printed || []) keep(shown)
           // No such item: the command finds none either. Locked or refused: it might still print it
           if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) why = `security could not read the item (exit ${got.exitCode})`
           // The vault can't find a form this short where it turns up
@@ -547,9 +595,9 @@ export function register(on, options) {
       const item = `The Keychain item ${service}${account ? ` (account ${account})` : ''}`
       if (exitCode === undefined) {
         // Every form security prints it in is hidden, should a command print the item itself
-        for (const shown of printed) keepSecret(shown)
+        for (const shown of printed) keep(shown)
         if (value) {
-          const tag = keepSecret(value)
+          const tag = keep(value)
           // The ONLY things Claude learns: the service, and how to use the value without seeing it
           return { result: `Loaded ${service}${account ? ` (account ${account})` : ''} from the Keychain${via ? via : '.'} ${howToUse(service, account, value, tag)}` }
         }
@@ -648,14 +696,14 @@ export function register(on, options) {
         const why = account ? badName('keychainAccount', account) : 'No Keychain account: set the keychainAccount option.'
         if (why) return { result: `Saving ${name} failed: ${why}` }
         await saveToKeychain($, name, account, value)
-        const tag = keepSecret(value)
+        const tag = keep(value)
         const pointer = pointerTo(name, account)
         $.ui.toast(`${name} saved to Keychain`)
         // The ONLY things Claude learns: the name, the place, and a placeholder
         return { result: `The user entered ${name}. It was saved to the macOS Keychain (service ${name}, account ${account}); .env was not touched. ${howToUse(name, account, value, tag)} In a later session, call use_secret with service ${name} and account ${account}.${pointer ? ` For an app that reads .env, write the line ENV_NAME=${pointer} there, never the value, and run the app with ${runnerPath($)} -- COMMAND.` : ''}` }
       }
       const where = await saveToDotenv($, await $.session.cwd(), name, value)
-      const tag = keepSecret(value)
+      const tag = keep(value)
       $.ui.toast(`${name} saved to ${where}`)
       // The ONLY things Claude learns: the name, the place, and a placeholder
       return { result: `The user entered ${name}. It was saved to ${where}. You can't see the value. To use it in a command or a file, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. Code should read it from the environment.` }
@@ -738,7 +786,7 @@ async function learnDotenv($, files) {
       for (const m of (await $.fs.read(path)).matchAll(ASSIGNMENT)) {
         const value = m[3].trim().replace(/^["']|["']$/g, '')
         // A pointer only names a Keychain item: it stays readable
-        if (value.length >= 6 && SECRET_NAME.test(m[2]) && !parsePointer(envValue(m[3]))) keepSecret(value)
+        if (value.length >= 6 && SECRET_NAME.test(m[2]) && !parsePointer(envValue(m[3]))) keep(value)
       }
     } catch {}
   }

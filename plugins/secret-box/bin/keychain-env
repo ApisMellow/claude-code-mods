@@ -64,6 +64,13 @@ trim() {
   printf '%s' "${s%"${s##*[![:space:]]}"}"
 }
 
+# Read the files byte by byte, whatever the caller's locale: a blank is space,
+# tab, CR, VT or FF, and anything else (U+2028, a no-break space) is text, as
+# hooks/keychain.js reads them. The caller's locale is put back before COMMAND.
+had_lc_all=${LC_ALL+1}
+saved_lc_all=${LC_ALL-}
+LC_ALL=C
+
 for file in ${files[@]+"${files[@]}"}; do
   while IFS= read -r line || [ -n "$line" ]; do
     [[ $line =~ $ASSIGN ]] || continue
@@ -102,4 +109,5 @@ for file in ${files[@]+"${files[@]}"}; do
   done < "$file"
 done
 
+if [ -n "$had_lc_all" ]; then LC_ALL=$saved_lc_all; else unset LC_ALL; fi
 exec "$@"

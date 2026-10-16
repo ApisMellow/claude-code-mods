@@ -194,21 +194,35 @@ export function pointerTo(service, account) {
   return `keychain:${escapePointer(service)}${account ? `?account=${escapePointer(account)}` : ''}`
 }
 
+// bin/keychain-env reads .env files in the C locale, where a blank is one of
+// space, tab, CR, VT and FF and every other character (U+2028, U+00A0) is
+// text. These follow it exactly, so the mod loads every pointer the runner
+// will resolve; tests/env-cases.ts pins the two together.
+const trimBlanks = (s) => s.replace(/^[ \t\r\v\f]+|[ \t\r\v\f]+$/g, '')
+const DQ = /^"([^"]*)"(?:[ \t\r\v\f]+#[^\n]*)?$/
+const SQ = /^'([^']*)'(?:[ \t\r\v\f]+#[^\n]*)?$/
+
 // A .env value as dotenv libraries read it: in quotes, the text inside them;
 // bare, the text before a ` #` comment
 export function envValue(raw) {
-  const v = String(raw).trim()
-  const q = /^"([^"]*)"(?:\s+#.*)?$/.exec(v) || /^'([^']*)'(?:\s+#.*)?$/.exec(v)
-  return q ? q[1] : v.replace(/\s+#.*$/, '').trim()
+  const v = trimBlanks(String(raw))
+  const q = DQ.exec(v) || SQ.exec(v)
+  return q ? q[1] : trimBlanks(v.replace(/[ \t\r\v\f]+#[^\n]*$/, ''))
 }
 
-// Each NAME=value line of a .env file, as [name, value]
+// False for a value whose opening quote doesn't close on its line: a
+// multi-line value (a PEM key) whose rest sits on the lines below
+export function quoteCloses(raw) {
+  const v = trimBlanks(String(raw))
+  return !/^["']/.test(v) || DQ.test(v) || SQ.test(v)
+}
+
+// Each NAME=value line of a .env file, as [name, value, raw value]
 export function envAssignments(text) {
   const out = []
   for (const line of String(text).split('\n')) {
-    // A CRLF file's \r goes too, as the runner's trim takes it
-    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line.replace(/\r$/, ''))
-    if (m) out.push([m[1], envValue(m[2])])
+    const m = /^[ \t\r\v\f]*(?:export[ \t\r\v\f]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t\r\v\f]*=[ \t\r\v\f]*([^\n]*)$/.exec(line)
+    if (m) out.push([m[1], envValue(m[2]), m[2]])
   }
   return out
 }

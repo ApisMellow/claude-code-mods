@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { dumpedItems, envPointers, envValue, keychainReads, parsePointer, pointerTo, SECURITY } from '../hooks/keychain'
+import { ENV_CASES } from './env-cases'
 import { call, CWD, dumpOf, hex, hexOf, LIST, mac, MIGRATE, registered, securityCalls, TAG, USE, wOutput, type Item, type Opts } from './fake-mac'
 
 const NAMES_ONLY = "Returns key names only and never fetches or returns any key's value."
@@ -458,4 +459,98 @@ test('migrate: only a .env file, and only one that exists', async ($, on) => {
   mac(on, {})
   expect(String((await call($, { tool: MIGRATE, file: 'config.json' })).result)).toContain('is not a .env file')
   expect(String((await call($, { tool: MIGRATE, file: '.env.prod' })).result)).toContain('could not be read')
+})
+
+// ----------------------------------------------- the runner's reader, in JS
+
+// tests/env-cases.ts; runner-parity.test.mts holds bin/keychain-env to the same cases
+for (const c of ENV_CASES) {
+  test(`envPointers, shared case: ${c.name}`, async () => {
+    expect(envPointers(c.text).map(([n, p]: [string, any]) => [n, p.service, p.account])).toEqual(c.pointers.map(([n, s, a]) => [n, s, a]))
+  })
+}
+
+// ------------------------------------- a key written after keychain: (B1, B2)
+
+// An OpenAI project key's shape, built at run time
+const PROJECT_KEY = 'sk-' + 'proj-' + 'Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90'
+
+test('a real key written after keychain: stays hidden, though it reads as a pointer, and real pointers still show', async ($, on) => {
+  const text = `OPENAI_API_KEY=keychain:${PROJECT_KEY}\nDB_PASSWORD=keychain:myapp/DB_PASSWORD\n`
+  mac(on, { files: { '.env': text }, output: text })
+  const r = String((await call($, { tool: 'Read', file_path: `${CWD}/.env` })).result)
+  expect(r).not.toContain(PROJECT_KEY)
+  expect(r).not.toContain('keychain:sk-')
+  expect(r).toContain('DB_PASSWORD=keychain:myapp/DB_PASSWORD')
+})
+
+test('a key already loaded into the vault stays hidden after keychain:', async ($, on) => {
+  const VALUE = hex(40)
+  const text = `OPENAI_API_KEY=keychain:${VALUE}\n`
+  mac(on, { items: [{ s: 'svc', value: VALUE }], files: { '.env': text }, output: text })
+  expect(String((await call($, { tool: USE, service: 'svc' })).result)).toMatch(TAG)
+  expect(String((await call($, { tool: 'Read', file_path: `${CWD}/.env` })).result)).not.toContain(VALUE)
+})
+
+test('a key too short for the scrubber stays hidden after keychain: once the mod has hidden it', async ($, on) => {
+  const SHORT = 'hunt3r7'
+  const text = `DB_PASSWORD=keychain:${SHORT}\n`
+  mac(on, { items: [{ s: 'db', value: SHORT }], files: { '.env': text }, output: text })
+  await call($, { tool: USE, service: 'db' })
+  expect(String((await call($, { tool: 'Read', file_path: `${CWD}/.env` })).result)).not.toContain(`keychain:${SHORT}`)
+})
+
+for (const [tool, input] of [
+  ['Write', (tag: string) => ({ file_path: `${CWD}/.env`, content: `OPENAI_API_KEY=keychain:${tag}\n` })],
+  ['Edit', (tag: string) => ({ file_path: `${CWD}/.env`, old_string: 'OPENAI_API_KEY=', new_string: `OPENAI_API_KEY=keychain:${tag}` })],
+  ['Bash', (tag: string) => ({ command: `echo OPENAI_API_KEY=keychain:${tag} >> .env` })],
+] as [string, (tag: string) => Record<string, string>][]) {
+  test(`${tool} with keychain:<placeholder> is refused before the key is put in its place`, async ($, on) => {
+    const seen: Record<string, unknown>[] = []
+    mac(on, { items: [{ s: 'svc', value: hex(41) }], seen })
+    const tag = String((await call($, { tool: USE, service: 'svc' })).result).match(TAG)![0]
+    const r = await call($, { tool, ...input(tag) })
+    expect(String(r.deny)).toContain('write its service name')
+    expect(seen.filter((s) => s.tool === tool)).toEqual([])
+  })
+}
+
+test('commit guard: a .env with a real key after keychain: is blocked', async ($, on) => {
+  mac(on, { files: { '.env': `OPENAI_API_KEY=keychain:${PROJECT_KEY}\nOTHER=keychain:openai\n` } })
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toBe(true)
+})
+
+test('commit guard: a .env with a vault value after keychain: is blocked', async ($, on) => {
+  const VALUE = hex(42)
+  mac(on, { items: [{ s: 'svc', value: VALUE }], files: { '.env': `OPENAI_API_KEY=keychain:${VALUE}\n` } })
+  await call($, { tool: USE, service: 'svc' })
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toBe(true)
+})
+
+const PEM = `PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEow${hex(43)}\n-----END RSA PRIVATE KEY-----"\nAPI_KEY=${hex(44)}\n`
+
+test('commit guard: a .env whose quote closes on a later line is blocked, pointers or not', async ($, on) => {
+  mac(on, { files: { '.env': `OPENAI_API_KEY=keychain:openai\nNOTE="first line\nsecond line"\n` } })
+  expect(Boolean((await call($, { tool: 'Bash', command: 'git add .env' })).deny)).toBe(true)
+})
+
+test('migrate: a quoted value spanning lines stays as it was, and the reason names the multi-line route', async ($, on) => {
+  const opts: Opts = { files: { '.env': PEM }, answer: 'Move them', argvs: [] }
+  mac(on, opts)
+  const r = String((await call($, { tool: MIGRATE })).result)
+  expect(r).toContain('PRIVATE_KEY (its value spans lines')
+  expect(r).toContain('multi-line-values.md')
+  expect(opts.files!['.env']).toBe(PEM.replace(`API_KEY=${hex(44)}`, 'API_KEY=keychain:repo/API_KEY?account=tester'))
+  expect(securityCalls(opts.argvs!).filter((a) => a[1] === 'add-generic-password').map((a) => a[a.indexOf('-s') + 1])).toEqual(['repo/API_KEY'])
+})
+
+test('migrate: a value with backslash escapes stays as it was', async ($, on) => {
+  const text = `TOKEN="line1\\nline2-${hex(45)}"\n`
+  const opts: Opts = { files: { '.env': text }, answer: 'Move them', argvs: [] }
+  mac(on, opts)
+  const r = String((await call($, { tool: MIGRATE })).result)
+  expect(r).toContain('TOKEN (its value spans lines or holds backslash escapes')
+  expect(r).toContain('Nothing was changed')
+  expect(opts.files!['.env']).toBe(text)
+  expect(securityCalls(opts.argvs!)).toEqual([])
 })
