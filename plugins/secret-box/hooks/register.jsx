@@ -63,7 +63,11 @@ function howToUse(service, account, value, tag) {
     return `You can't see the value. To use it, write ${tag} in a Bash command: it becomes the real value when the command runs and is hidden again in the output.${short} ${never}`
   }
   if (/^[\x20-\x7e]*$/.test(value)) {
-    return `You can't see the value. It holds a space or a shell character, so it can't go into a command as a placeholder. Instead, put this in the Bash command where the value goes, exactly as written: ${readCommand(service, account)}. The shell reads the value from the Keychain as the command runs, so it never appears in the command, and anything the command prints of it comes back hidden.${short} ${never}`
+    // Pasted with its own quotes into a string already in double quotes, the
+    // quotes would cancel and the shell would split the value into fragments
+    const quoted = readCommand(service, account)
+    const bare = quoted.slice(1, -1)
+    return `You can't see the value. It holds a space or a shell character, so it can't go into a command as a placeholder. Instead, have the shell read it from the Keychain where the value goes. As a whole argument of its own, write exactly: ${quoted}. Inside a string that is already in double quotes, write it without the outer quotes, so it stays one word inside that string: -H "Authorization: Bearer ${bare}". The value never appears in the command, and anything the command prints of it comes back hidden.${short} ${never}`
   }
   return `You can't see the value. It holds characters that can't safely go into a Bash command (a newline, say), so it can't be used here. ${never} Ask the user to store it base64-encoded instead, as the secret-box README describes.`
 }

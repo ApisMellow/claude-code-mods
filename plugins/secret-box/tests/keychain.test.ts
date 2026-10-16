@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { boxBackend, keychainReads, SECURITY, SHELL_ACTIVE } from '../hooks/keychain'
+import { boxBackend, keychainReads, MACOS_VERSION_FILE, SECURITY, SHELL_ACTIVE } from '../hooks/keychain'
 import { unmaskable } from '../hooks/register'
 
 const USE = 'mcp__secret-box__use_secret'
@@ -86,6 +86,7 @@ type Opts = {
   items?: Item[]
   platform?: 'Darwin' | 'Linux'
   uname?: 'both' | 'bin-only' | 'none' // which of /usr/bin/uname and /bin/uname run (both by default)
+  versionFile?: 'present' | 'absent' | 'fails' // macOS's SystemVersion.plist, asked when no uname answers
   env?: Record<string, string> // in place of USER and HOME
   toasts?: string[]
   fail?: { exitCode: number; stdout: string; stderr: string } // every security call answers this instead
@@ -127,7 +128,10 @@ function mac(on: any, opts: Opts = {}) {
     return { result: typeof out === 'function' ? out(String(e.command ?? '')) : out ?? 'ran' }
   })
   on('session.cwd', () => ({ value: '/repo' }))
-  on('fs.exists', () => ({ value: false }))
+  on('fs.exists', (_$: unknown, e: { path: string }) => {
+    if (e.path !== MACOS_VERSION_FILE) return { value: false }
+    return opts.versionFile === 'fails' ? { deny: 'not allowed' } : { value: opts.versionFile === 'present' }
+  })
   on('fs.write', (_$: unknown, e: { path: string; text: string }) => {
     opts.writes?.push({ path: e.path, text: e.text })
     return { value: undefined }
@@ -221,12 +225,18 @@ for (const [name, VALUE] of SHELLY) {
     mac(on, { items: [{ s: "Bob's site", a: 'bob x', value: VALUE }] })
     const r = String((await call($, { tool: USE, service: "Bob's site", account: 'bob x' })).result)
     const command = `"$(${SECURITY} find-generic-password -s 'Bob'\\''s site' -a 'bob x' -w)"`
+    const inString = `-H "Authorization: Bearer ${command.slice(1, -1)}"`
     expect(r).not.toMatch(TAG)
     expect(r).not.toContain(VALUE)
-    expect(r).toContain(command)
+    // Both ways to place it: quoted as a whole argument, bare inside a quoted string
+    expect(r).toContain(`As a whole argument of its own, write exactly: ${command}.`)
+    expect(r).toContain(`Inside a string that is already in double quotes, write it without the outer quotes`)
+    expect(r).toContain(inString)
     expect(r).toContain('Never write the value into a file')
-    // That command is a read the pre-load pins to this very item
-    expect(keychainReads(`printf '%s' ${command} | tee out.txt`, ENV)).toEqual([{ kind: 'generic', criteria: [['-s', "Bob's site"], ['-a', 'bob x']], keychains: [] }])
+    // Each is a read the pre-load pins to this very item
+    const read = [{ kind: 'generic', criteria: [['-s', "Bob's site"], ['-a', 'bob x']], keychains: [] }]
+    expect(keychainReads(`printf '%s' ${command} | tee out.txt`, ENV)).toEqual(read)
+    expect(keychainReads(`curl ${inString} https://api.example.com`, ENV)).toEqual(read)
   })
 }
 
@@ -617,18 +627,38 @@ test("Windows says so in OS, and uname never runs", async ($, on) => {
   expect(argvs.filter((a) => a[0]!.endsWith('uname'))).toEqual([])
 })
 
-test("when uname can't answer, use_secret stays on and a toast says why", async ($, on) => {
+test("with no uname, macOS's version file says it is a Mac", async ($, on) => {
   const toasts: string[] = []
-  const specs = await registered($, on, { uname: 'none', toasts })
+  const specs = await registered($, on, { uname: 'none', versionFile: 'present', toasts })
+  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(specs[0]!.description).toContain('macOS Keychain')
+  expect(toasts).toEqual([])
+})
+
+test('with no uname and no macOS version file (NixOS, Termux), it is the upstream mod', async ($, on) => {
+  const toasts: string[] = []
+  const specs = await registered($, on, { uname: 'none', versionFile: 'absent', toasts })
+  expect(specs.map((s) => s.name)).toEqual(['request_secret'])
+  expect(specs[0]!.description).toBe(UPSTREAM_DESCRIPTION)
+  expect(toasts).toEqual([])
+})
+
+test('with no uname and no macOS version file, backend auto is the upstream box', async ($, on) => {
+  await expectUpstreamBox($, on, { uname: 'none', versionFile: 'absent' })
+})
+
+test("when neither uname nor the version file can be checked, use_secret stays on and a toast says why", async ($, on) => {
+  const toasts: string[] = []
+  const specs = await registered($, on, { uname: 'none', versionFile: 'fails', toasts })
   expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
   expect(toasts.join('\n')).toContain("couldn't tell whether this is a Mac")
 })
 
-test("when uname can't answer, the box with backend auto writes nothing", async ($, on) => {
+test("when neither can be checked, the box with backend auto writes nothing", async ($, on) => {
   const opened: string[] = []
   const writes: { path: string; text: string }[] = []
   const argvs: string[][] = []
-  mac(on, { uname: 'none', opened, writes, argvs })
+  mac(on, { uname: 'none', versionFile: 'fails', opened, writes, argvs })
   const r = String((await call($, { tool: BOX, name: 'STRIPE_SECRET_KEY', reason: 'x' })).result)
   expect(r).toContain("couldn't tell whether this is a Mac")
   expect(r).toContain('nothing was written')
@@ -706,7 +736,7 @@ test('off macOS the box defaults to dotenv: the upstream box', async ($, on) => 
 })
 
 test("when uname can't answer, backend dotenv set by hand is still the upstream box", { options: { backend: 'dotenv' } }, async ($, on) => {
-  await expectUpstreamBox($, on, { uname: 'none' })
+  await expectUpstreamBox($, on, { uname: 'none', versionFile: 'fails' })
 })
 
 test('a value with a space typed into the box gets the read-it command, not a placeholder', async ($, on) => {

@@ -22,6 +22,9 @@ export const SHELL_ACTIVE = /[\s$`"'\\;&|<>()*?[\]{}#~]|[\x00-\x1f\x7f]/
 // Whether this is a Mac: 'mac', 'other', or 'unknown' when it can't be told.
 // The mods API has no platform call: Windows says so in OS; anything else
 // answers uname, run by its full path so nothing on PATH stands in for it.
+// Where neither uname is there (NixOS, Termux), every Mac has macOS's version
+// file; only if that can't be checked either is the platform unknown.
+export const MACOS_VERSION_FILE = '/System/Library/CoreServices/SystemVersion.plist'
 export async function platformOf($) {
   try {
     if ((await $.env.get('OS')) === 'Windows_NT') return 'other'
@@ -33,7 +36,11 @@ export async function platformOf($) {
       if (name) return name === 'Darwin' ? 'mac' : 'other'
     } catch {}
   }
-  return 'unknown'
+  try {
+    return (await $.fs.exists(MACOS_VERSION_FILE)) ? 'mac' : 'other'
+  } catch {
+    return 'unknown'
+  }
 }
 
 // Where the box saves: keychain, dotenv, or unknown when `auto` (and any value
