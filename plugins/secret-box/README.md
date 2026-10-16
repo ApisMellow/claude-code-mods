@@ -1,14 +1,14 @@
 # secret-box
 
-A Claude Code mod that lets Claude use a secret without ever seeing it. When Claude needs an API key, it calls a `request_secret` tool, a masked box opens, you paste the key, and the mod saves it to the macOS Keychain (or, with `backend: dotenv`, to `.env`). A key already in the Keychain is loaded with `use_secret`. Claude gets a placeholder like `[REDACTED-SECRET-3f9a1c2e]` instead of the value, and the placeholder turns into the real key whenever a tool runs. Any key a tool prints comes back to Claude as a placeholder, and committing `.env` is refused.
+A Claude Code mod that lets Claude use a secret without ever seeing it. When Claude needs an API key, it calls a `request_secret` tool, a masked box opens, you paste the key, and the mod saves it to the macOS Keychain (or, with `backend: dotenv`, to `.env`). A key already in the Keychain is loaded with `use_secret`. The Keychain parts are macOS only; elsewhere the box writes `.env` as it always did. Claude gets a placeholder like `[REDACTED-SECRET-3f9a1c2e]` instead of the value, and the placeholder turns into the real key whenever a tool runs. Any key a tool prints comes back to Claude as a placeholder, and committing `.env` is refused.
 
-![secret-box: on the left Claude calls secret-box - request_secret for STRIPE_SECRET_KEY and waits; on the right the secret box pane asks for STRIPE_SECRET_KEY with the reason, and the value field shows only dots; below, the four steps: Claude calls a tool, you paste into a masked box, the mod writes .env and .gitignore, Claude gets a placeholder that turns into the key when a tool runs](screenshot.png)
+![secret-box: on the left Claude calls secret-box - request_secret for STRIPE_SECRET_KEY and waits; on the right the secret box pane asks for STRIPE_SECRET_KEY with the reason, and the value field shows only dots; below, the four steps: Claude calls a tool, you paste into a masked box, the mod writes .env and .gitignore (the dotenv backend, shown here; on macOS the default saves to the Keychain instead), Claude gets a placeholder that turns into the key when a tool runs](screenshot.png)
 
 A key that reaches the conversation is in the transcript for good. It is sent to the model on every turn after, kept in the session file on disk, and replayed into every fork of the session. You can't take it back afterwards, so the only fix is to never send it. Keys get in two ways: you paste one, or a tool prints one (a `cat .env`, a config file, an API answer). secret-box closes both, and still lets Claude run the code that needs the key.
 
 - **A tool to ask with.** `request_secret` takes a variable name and a one-line reason. Its description tells Claude to use it instead of asking you to paste.
 - **A masked box.** A pane opens beside the transcript with the field already focused. It only ever draws dots and a character count.
-- **A placeholder to use.** The mod saves the value to the Keychain (with `backend: dotenv`, it writes `NAME=value` to `.env` and makes sure `.gitignore` covers it), then tells Claude the name and a placeholder. Claude can put the placeholder in a command or a file: `curl -u [REDACTED-SECRET-3f9a1c2e]: https://api.stripe.com/v1/balance` runs with the real key.
+- **A placeholder to use.** The mod saves the value to the Keychain (with `backend: dotenv`, it writes `NAME=value` to `.env` and makes sure `.gitignore` covers it), then tells Claude the name and a placeholder. Claude puts the placeholder in a command: `curl -u [REDACTED-SECRET-3f9a1c2e]: https://api.stripe.com/v1/balance` runs with the real key. A file Claude writes gets the real key too, but see the file-history tip under Keychain backend before relying on that.
 - **Placeholders on the way out.** Every tool result is scanned before Claude sees it. About 70 vendor key shapes (`sk_live_`, `ghp_`, `AKIA`, `xoxb-` and more), any key shaped like a short lowercase prefix and a long random body (`imp_` and 40 hex), passwords on CLI flags and in connection strings, base64 that decodes to a key, high-entropy tokens, every `.env` value with a secret name, and every value the mod already knows come back as placeholders. `cat .env` still shows `PORT=3000`.
 - **Placeholders on the way in.** A key you paste into the prompt by mistake is swapped for a placeholder before Claude reads it.
 - **Never committed.** `git add .env` and a `git commit` that would carry a `.env` file are refused, because a pushed key can't be taken back.
@@ -51,7 +51,7 @@ Accept the trust prompt (mods don't load in an untrusted folder). Tell Claude `b
 
 ## Keychain backend (macOS)
 
-By default the box saves a key to the macOS Keychain as a generic password: the name Claude asked for is the service, and your macOS user name is the account (set `keychainAccount` to change it). Nothing is written to `.env` or `.gitignore`. Set `backend` to `dotenv` for the `.env` behavior. `.env` files are still learned in both modes, so projects that keep one stay covered.
+On macOS the box saves a key to the Keychain as a generic password by default (`backend: auto`): the name Claude asked for is the service, and your macOS user name is the account (set `keychainAccount` to change it). Nothing is written to `.env` or `.gitignore`. Set `backend` to `dotenv` for the `.env` behavior. `use_secret` and the masking of direct reads below are on whenever the Mac is, whatever `backend` says. On other systems they don't exist and `auto` means `dotenv`. `.env` files are still learned in both modes, so projects that keep one stay covered.
 
 **Adding a key by hand.** In a terminal:
 
@@ -61,17 +61,19 @@ security add-generic-password -s OPENAI_API_KEY -a "$USER" -w
 
 With `-w` last, `security` prompts for the value, so the key never lands in your shell history. Add `-U` to replace an item that is already there.
 
-**How Claude asks for it.** Claude calls `secret-box - use_secret` with the service name, and the account when several items share that service. The mod runs `/usr/bin/security find-generic-password -s NAME -w` itself, by argv with no shell, and hands Claude only a placeholder. The items you already have work as they are, with no required prefix. If the item is missing, Claude gets the `security add-generic-password` command above to pass on to you. Ask for it by name if Claude doesn't think of it: `use_secret OPENAI_API_KEY and check the key works`.
+**How Claude asks for it.** Claude calls `secret-box - use_secret` with the service name, and the account when several items share that service. The mod runs `/usr/bin/security find-generic-password -s NAME -g` itself, by argv with no shell, and hands Claude only a placeholder. The items you already have work as they are, with no required prefix. If the item is missing, Claude gets the `security add-generic-password -U` command above to pass on to you; if the keychain is locked or access was refused, it asks you to unlock it or allow access. Ask for it by name if Claude doesn't think of it: `use_secret OPENAI_API_KEY and check the key works`.
 
-**A direct read is masked too.** If Claude runs `security find-generic-password -s NAME -w` (or `-g`) in Bash anyway, the mod reads the same item first, so what the command prints comes back as a placeholder. This turns the usual accident into a harmless one; it isn't a wall. A read it can't parse (a service from `$VAR`, flags run together like `-sNAME`) runs as written, and only the detector scans its output, which doesn't hide bare hex.
+**A direct read is masked too.** If Claude runs `security find-generic-password … -w` (or `-g`, or `find-internet-password`) in Bash anyway, the mod first reads the item that command reads, with the same match options (`-s`, `-a`, `-l` and the rest) and keychain files, and hides every form `security` prints it in. For a value with a newline, a tab or any non-ASCII character, `-w` prints hex instead of the text, and that is hidden as well. `$USER`, `$LOGNAME`, `$HOME` and `~/` are resolved. This turns the usual accident into a harmless one; it isn't a wall. A read the mod can't pin down to one item runs as written, and only the detector scans its output, which doesn't hide bare hex. That covers a variable it doesn't hold, `sudo` or another prefix, a keychain file given by a relative path, and a read inside a quoted `sh -c` script.
+
+**Multi-line values.** A value with a newline (a PEM key, say) can't be put into a Bash command: the redactor refuses to restore any value holding a newline or shell characters. Writing it to a file with Write would put a copy in file history (below). Instead, save it base64-encoded, `security add-generic-password -U -s NAME -a "$USER" -w "$(base64 -i key.pem)"`, and decode it straight into what needs it: `printf '%s' [REDACTED-SECRET-…] | base64 -d | ssh-add -`. Don't let the decoded text print. The vault knows the base64 form, not the decoded one.
 
 **Threat model.** The goal is to keep keys out of anything written to disk under `~/.claude/` (transcripts, file history) and out of plaintext files in your projects. The concern is an attacker on the machine, an exfiltrated transcript, or device-management/DLP software finding a key on disk. It is not a sandbox against the agent: deliberate exfiltration is out of scope (see Limits).
 
 **Tip: file history.** Claude Code copies a file to `~/.claude/file-history/` before Write or Edit changes it, so a key Claude writes into a file is copied there in plaintext. Keep keys out of files (use the placeholder in Bash commands), or set `"fileCheckpointingEnabled": false` in that project's `.claude/settings.json`. That costs `/rewind`'s code restore in that project.
 
-- The box hands the value to `security add-generic-password` in its argv, so `ps` can see it while that command runs. It is never written to disk.
+- The box hands the value to `security add-generic-password` in its argv, so `ps` can see it while that command runs. The mod writes it nowhere else. But `$.process.run` is a hookable event, so any other mod you have installed can see the argv of the save, and the output of each Keychain read the mod makes.
 - An item another app created may make macOS ask whether `security` can read it. Allow it, or the read fails and Claude is told the item could not be read.
-- A Keychain value under 8 characters is restored into commands, but not hidden wherever else it turns up (the same limit as `.env`).
+- A Keychain value under 8 characters is restored into commands, but it can't be hidden where it turns up later. A direct `-w` read of such a value prints it in the clear, into the transcript (the same limit as `.env`).
 
 ## Settings
 
@@ -79,7 +81,7 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 
 | Option | Default | What it does |
 | :- | :- | :- |
-| `backend` | `keychain` | Where the box saves: `keychain` (macOS Keychain) or `dotenv` (the project `.env`) |
+| `backend` | `auto` | Where the box saves: `auto` (the Keychain on macOS, `.env` elsewhere), `keychain` (macOS only; refused elsewhere rather than falling back to a plaintext file) or `dotenv` (the project `.env`) |
 | `keychainAccount` | empty | The account the box saves Keychain items under. Empty means your macOS user name |
 | `secrets` | `true` | Hide secrets in tool output and prompts |
 | `pii` | `false` | Hide email addresses and public IP addresses |
@@ -133,7 +135,7 @@ claude plugin test .
 node --experimental-strip-types tests/detect.test.mts
 ```
 
-`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash, and both backends of the box, with `security` faked. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
+`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms, with a fake `security` that prints what the real one does. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
 
 Tested with Claude Code 2.1.296.
 

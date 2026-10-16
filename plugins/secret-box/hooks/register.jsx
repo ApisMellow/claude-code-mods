@@ -18,7 +18,7 @@
 
 import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
 import { keepSecret } from './detect.ts'
-import { addHint, badName, defaultAccount, keychainReads, NOT_FOUND, readKeychain, saveToKeychain } from './keychain.js'
+import { addHint, badName, boxBackend, defaultAccount, isMacOS, keychainReads, NOT_FOUND, readKeychain, saveToKeychain, serviceRead } from './keychain.js'
 
 const TOOL = 'mcp__secret-box__request_secret'
 const USE = 'mcp__secret-box__use_secret'
@@ -33,17 +33,37 @@ let pending = null // { name, reason, value, answer, isInBand }
 const SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|CREDENTIAL|AUTH|PRIVATE|DSN|SALT|SIGNING|WEBHOOK/i
 const ASSIGNMENT = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)(.*)$/gm
 
+// A Keychain read in a Bash command that the pre-load can't load exactly: it
+// can't be parsed, it names something only the shell knows, or the fetch
+// failed. Every such case comes here, so the policy is this one switch.
+// false: the command runs, and only the detector scans what it prints.
+// true: the command is refused.
+const REFUSE_UNMASKABLE = false
+export function unmaskable(why) {
+  return REFUSE_UNMASKABLE
+    ? { deny: `secret-box: this command reads the Keychain, but ${why}, so what it prints can't be hidden. Use use_secret instead.` }
+    : undefined
+}
+
+// Whether this is a Mac, asked once per load (`platform` is that load's memo)
+function onMac($, platform) {
+  return (platform.isMac ??= isMacOS($))
+}
+
 export function register(on, options) {
   // request_secret and use_secret answer with a live placeholder: keep it live
   LIVE_TAG_TOOLS.add(TOOL)
   LIVE_TAG_TOOLS.add(USE)
   brand.name = 'secret-box'
   redactor(on, options || {})
-  // Where the box saves: the macOS Keychain unless the backend is dotenv
-  const isKeychain = (options || {}).backend !== 'dotenv'
+  // use_secret and the pre-load exist on macOS only, and the box saves to the
+  // Keychain only there (unless backend says otherwise). Asked once per load.
+  const platform = {}
 
   // 1. Give Claude the tools, and teach the vault the secrets already in .env
   on('session.start', async ($, e, next) => {
+    const isMac = await onMac($, platform)
+    const isKeychain = boxBackend((options || {}).backend, isMac) === 'keychain'
     await $.tool.register({
       name: 'request_secret',
       description: isKeychain
@@ -67,7 +87,7 @@ export function register(on, options) {
       },
       isDeferred: false,
     })
-    await $.tool.register({
+    if (isMac) await $.tool.register({
       name: 'use_secret',
       description:
         'Load a secret the user keeps in the macOS Keychain (a generic password) without it ever entering the ' +
@@ -106,19 +126,36 @@ export function register(on, options) {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secret-box: could not check this .env file, so the call is blocked to be safe.' }))
 
   // 3b. A command that reads the Keychain itself (`security find-generic-password
-  //     -s NAME -w`): load the same item into the vault before it runs, so what
-  //     it prints (-w on stdout, -g on stderr) comes back hidden. Not a wall: a
-  //     read it can't parse or fetch runs as written, and the detector still
-  //     scans the output.
+  //     -s NAME -w`): load the item it reads into the vault before it runs, by
+  //     the same match options and keychain files, so what it prints (-w on
+  //     stdout, -g on stderr, as text or hex) comes back hidden. A read it
+  //     can't load exactly goes to unmaskable().
   //     A hook nested under the redactor's that throws fails into the
-  //     redactor's .catch, which withholds the call, not into its own. So a
-  //     fetch that fails is passed over here.
+  //     redactor's .catch, which withholds the call, not into its own. So
+  //     failures are handled here.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    for (const read of keychainReads(String(e.command || ''))) {
-      try {
-        const { value } = await readKeychain($, read)
-        if (value) keepSecret(value)
-      } catch {}
+    const command = String(e.command || '')
+    if (!/find-(?:generic|internet)-password/.test(command) || !(await onMac($, platform))) return next(e)
+    let reads
+    try {
+      reads = keychainReads(command, { USER: await $.env.get('USER'), LOGNAME: await $.env.get('LOGNAME'), HOME: await $.env.get('HOME') })
+    } catch {
+      reads = [{ unknown: 'secret-box could not read it' }]
+    }
+    for (const read of reads) {
+      let why = read.unknown
+      if (!why) {
+        try {
+          const got = await readKeychain($, read)
+          for (const shown of got.printed || []) keepSecret(shown)
+          // No such item: the command finds none either. Locked or refused: it might still print it
+          if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) why = `security could not read the item (exit ${got.exitCode})`
+        } catch (err) {
+          why = String((err && err.message) || err)
+        }
+      }
+      const refusal = why && unmaskable(why)
+      if (refusal) return refusal
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -127,23 +164,33 @@ export function register(on, options) {
   //     What `security` prints is never put in the answer. Failures are
   //     answered here, for the same reason as above.
   on('tool.call', { tool: USE }, async ($, e, next) => {
+    if (!(await onMac($, platform))) return { result: 'use_secret needs macOS. Nothing was loaded.' }
     const service = String(e.service ?? '')
     const account = String(e.account ?? '')
     const why = (service ? badName('service', service) : 'Give the Keychain service name.') || badName('account', account)
     if (why) return { result: `${why} Nothing was loaded.` }
 
     try {
-      const { value, exitCode } = await readKeychain($, { service, account })
-      if (value) {
-        const tag = keepSecret(value)
-        // The ONLY things Claude learns: the service and a placeholder
-        return { result: `Loaded ${service} from the Keychain. You can't see the value. To use it, write ${tag} in a Bash command: it becomes the real value when the command runs and is hidden again in the output. Keep it out of files you write with Write or Edit: Claude Code keeps a plain copy of edited files under ~/.claude/file-history.` }
+      const { value, printed, exitCode } = await readKeychain($, serviceRead(service, account))
+      const item = `The Keychain item ${service}${account ? ` (account ${account})` : ''}`
+      if (exitCode === undefined) {
+        // Every form security prints it in is hidden, should a command print the item itself
+        for (const shown of printed) keepSecret(shown)
+        if (value) {
+          const tag = keepSecret(value)
+          // The ONLY things Claude learns: the service and a placeholder
+          return { result: `Loaded ${service} from the Keychain. You can't see the value. To use it, write ${tag} in a Bash command: it becomes the real value when the command runs and is hidden again in the output. Keep it out of files you write with Write or Edit: Claude Code keeps a plain copy of edited files under ~/.claude/file-history.` }
+        }
+        if (value === undefined) return { result: `${item} holds bytes that are not text, so it can't be used in a command. Nothing was loaded.` }
       }
       const hint = addHint(service, account || (await defaultAccount($, options)))
-      const what = exitCode === NOT_FOUND ? `No Keychain item has the service ${service}${account ? ` and account ${account}` : ''}.`
-        : value === '' ? `The Keychain item ${service} is empty.`
-        : `The Keychain item ${service} could not be read (security exited ${exitCode}): the Keychain may be locked, or access was denied.`
-      return { result: `${what} Ask the user to add it in a terminal with this command, which prompts for the value so the key never lands in shell history:\n${hint}\nThen call use_secret again.` }
+      if (exitCode === NOT_FOUND) {
+        return { result: `No Keychain item has the service ${service}${account ? ` and account ${account}` : ''}. Ask the user to add it in a terminal with this command, which prompts for the value so the key never lands in shell history:\n${hint}\nThen call use_secret again.` }
+      }
+      if (exitCode === undefined) {
+        return { result: `${item} holds no value. Ask the user to set one in a terminal with this command, which prompts for it:\n${hint}\nThen call use_secret again.` }
+      }
+      return { result: `${item} could not be read (security exited ${exitCode}): the keychain may be locked, or access to the item was refused. Ask the user to unlock it (security unlock-keychain) or to allow access when macOS asks, then call use_secret again.` }
     } catch (err) {
       return { result: `secret-box could not read the Keychain: ${String((err && err.message) || err).slice(0, 200)}. Nothing was loaded.` }
     }
@@ -160,6 +207,10 @@ export function register(on, options) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
       return { result: `"${name}" is not a valid variable name. Use letters, digits and underscores.` }
     }
+    const isMac = await onMac($, platform)
+    const isKeychain = boxBackend((options || {}).backend, isMac) === 'keychain'
+    // backend keychain set by hand off macOS: refuse before anyone types, rather than fall back to a plaintext .env
+    if (isKeychain && !isMac) return { result: `secret-box's Keychain backend needs macOS, so ${name} was not asked for. Set the backend option to auto or dotenv.` }
     // A plain -p run has no one to type into the box
     if ((await $.session.surfaces()).length === 0) {
       return { result: `secret-box needs an interactive session to collect ${name}. Ask the user to run Claude Code interactively.` }
@@ -198,7 +249,7 @@ export function register(on, options) {
         const tag = keepSecret(value)
         $.ui.toast(`${name} saved to Keychain`)
         // The ONLY things Claude learns: the name, the place, and a placeholder
-        return { result: `The user entered ${name}. It was saved to the macOS Keychain (service ${name}, account ${account}); .env was not touched. You can't see the value. To use it in a command, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. In a later session, load it with use_secret.` }
+        return { result: `The user entered ${name}. It was saved to the macOS Keychain (service ${name}, account ${account}); .env was not touched. You can't see the value. To use it in a command, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. In a later session, call use_secret with service ${name} and account ${account}.` }
       }
       const where = await saveToDotenv($, await $.session.cwd(), name, value)
       const tag = keepSecret(value)
