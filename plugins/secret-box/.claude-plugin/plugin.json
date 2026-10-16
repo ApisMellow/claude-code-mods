@@ -1,7 +1,7 @@
 {
   "name": "secret-box",
   "version": "0.5.0",
-  "description": "Claude can use a secret without seeing it: a masked box saves keys to .env and gives Claude a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
+  "description": "Claude can use a secret without seeing it: a masked box saves keys to the macOS Keychain (or .env) and gives Claude a placeholder, use_secret loads a Keychain item as a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
   "author": {
     "name": "Ray Amjad",
     "url": "https://github.com/ray-amjad"
@@ -9,6 +9,19 @@
   "repository": "https://github.com/ray-amjad/claude-code-mods/tree/main/plugins/secret-box",
   "license": "MIT",
   "userConfig": {
+    "backend": {
+      "type": "string",
+      "title": "Where the box saves",
+      "description": "keychain saves to the macOS Keychain (service = the name, nothing written to .env); dotenv writes the project .env as before",
+      "options": ["keychain", "dotenv"],
+      "default": "keychain"
+    },
+    "keychainAccount": {
+      "type": "string",
+      "title": "Keychain account",
+      "description": "The account the box saves Keychain items under. Empty means your macOS user name",
+      "default": ""
+    },
     "secrets": {
       "type": "boolean",
       "title": "Hide secrets",

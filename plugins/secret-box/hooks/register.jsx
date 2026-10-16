@@ -3,7 +3,8 @@
 // Pattern: guard what you can't undo. A secret in the conversation is in the
 // transcript for good, so it must never get there:
 //   - In: Claude calls request_secret, you paste the value into a masked box,
-//     the mod writes it to .env and hands Claude a placeholder.
+//     the mod saves it to the macOS Keychain (or .env) and hands Claude a
+//     placeholder. use_secret loads a Keychain item as a placeholder too.
 //   - Out: every secret a tool would show Claude (a `cat .env`, an API answer,
 //     a key you paste) is swapped for a placeholder like [REDACTED-SECRET-1a2b3c4d].
 //   - Use: a placeholder in a tool's input becomes the real value as the tool
@@ -11,13 +12,16 @@
 //   - Never: committing .env is refused, since a pushed key can't be taken back.
 //
 // The redaction is transcript-redactor, unchanged (./redact.ts, ./detect.ts):
-// its hooks do the In, Out and Use. This file adds the box, teaches the vault
-// the values in .env, and guards commits. Nothing is written but .env.
+// its hooks do the In, Out and Use. This file adds the box and use_secret,
+// teaches the vault the values in .env and the Keychain items a command reads,
+// and guards commits. Nothing is written but the Keychain item or .env.
 
 import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
 import { keepSecret } from './detect.ts'
+import { addHint, badName, defaultAccount, keychainReads, NOT_FOUND, readKeychain, saveToKeychain } from './keychain.js'
 
 const TOOL = 'mcp__secret-box__request_secret'
+const USE = 'mcp__secret-box__use_secret'
 const PANE = 'secret-box'
 const DOT = '•'
 
@@ -30,28 +34,55 @@ const SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|CREDENTIAL|AUTH|PRIVATE|DSN|SALT|
 const ASSIGNMENT = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)(.*)$/gm
 
 export function register(on, options) {
-  // request_secret answers with a live placeholder: keep it live
+  // request_secret and use_secret answer with a live placeholder: keep it live
   LIVE_TAG_TOOLS.add(TOOL)
+  LIVE_TAG_TOOLS.add(USE)
   brand.name = 'secret-box'
   redactor(on, options || {})
+  // Where the box saves: the macOS Keychain unless the backend is dotenv
+  const isKeychain = (options || {}).backend !== 'dotenv'
 
-  // 1. Give Claude the tool, and teach the vault the secrets already in .env
+  // 1. Give Claude the tools, and teach the vault the secrets already in .env
   on('session.start', async ($, e, next) => {
     await $.tool.register({
       name: 'request_secret',
-      description:
-        'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
-        'The user pastes it into a masked box and the mod saves it to the project .env. You get back the ' +
-        'variable name and a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
-        'or file and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to ' +
-        'paste a secret into chat.',
+      description: isKeychain
+        ? 'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
+          'The user pastes it into a masked box and the mod saves it to the macOS Keychain under that name. ' +
+          'You get back a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
+          'and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to paste a ' +
+          'secret into chat. For a secret already in the Keychain, use use_secret.'
+        : 'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
+          'The user pastes it into a masked box and the mod saves it to the project .env. You get back the ' +
+          'variable name and a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
+          'or file and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to ' +
+          'paste a secret into chat.',
       inputSchema: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Environment variable name, e.g. STRIPE_SECRET_KEY' },
+          name: { type: 'string', description: isKeychain ? 'Name to save it under (the Keychain service), e.g. STRIPE_SECRET_KEY' : 'Environment variable name, e.g. STRIPE_SECRET_KEY' },
           reason: { type: 'string', description: 'One short line telling the user why it is needed' },
         },
         required: ['name', 'reason'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'use_secret',
+      description:
+        'Load a secret the user keeps in the macOS Keychain (a generic password) without it ever entering the ' +
+        'conversation. Give its service name, and the account when several items share that service. You get ' +
+        'back a placeholder like [REDACTED-SECRET-1a2b3c4d]: write it in a Bash command and it becomes the real ' +
+        'value when the command runs, and is hidden again in the output. Use this INSTEAD of running ' +
+        '`security find-generic-password` yourself. If the item is missing, you get the command the user can ' +
+        'run to add it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          service: { type: 'string', description: 'The Keychain service name, e.g. OPENAI_API_KEY' },
+          account: { type: 'string', description: 'The Keychain account, only when several items share the service' },
+        },
+        required: ['service'],
       },
       isDeferred: false,
     })
@@ -73,6 +104,50 @@ export function register(on, options) {
     if (files.length > 0) await learnDotenv($, files)
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secret-box: could not check this .env file, so the call is blocked to be safe.' }))
+
+  // 3b. A command that reads the Keychain itself (`security find-generic-password
+  //     -s NAME -w`): load the same item into the vault before it runs, so what
+  //     it prints (-w on stdout, -g on stderr) comes back hidden. Not a wall: a
+  //     read it can't parse or fetch runs as written, and the detector still
+  //     scans the output.
+  //     A hook nested under the redactor's that throws fails into the
+  //     redactor's .catch, which withholds the call, not into its own. So a
+  //     fetch that fails is passed over here.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    for (const read of keychainReads(String(e.command || ''))) {
+      try {
+        const { value } = await readKeychain($, read)
+        if (value) keepSecret(value)
+      } catch {}
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // 3c. use_secret: load a Keychain item and answer with its placeholder only.
+  //     What `security` prints is never put in the answer. Failures are
+  //     answered here, for the same reason as above.
+  on('tool.call', { tool: USE }, async ($, e, next) => {
+    const service = String(e.service ?? '')
+    const account = String(e.account ?? '')
+    const why = (service ? badName('service', service) : 'Give the Keychain service name.') || badName('account', account)
+    if (why) return { result: `${why} Nothing was loaded.` }
+
+    try {
+      const { value, exitCode } = await readKeychain($, { service, account })
+      if (value) {
+        const tag = keepSecret(value)
+        // The ONLY things Claude learns: the service and a placeholder
+        return { result: `Loaded ${service} from the Keychain. You can't see the value. To use it, write ${tag} in a Bash command: it becomes the real value when the command runs and is hidden again in the output. Keep it out of files you write with Write or Edit: Claude Code keeps a plain copy of edited files under ~/.claude/file-history.` }
+      }
+      const hint = addHint(service, account || (await defaultAccount($, options)))
+      const what = exitCode === NOT_FOUND ? `No Keychain item has the service ${service}${account ? ` and account ${account}` : ''}.`
+        : value === '' ? `The Keychain item ${service} is empty.`
+        : `The Keychain item ${service} could not be read (security exited ${exitCode}): the Keychain may be locked, or access was denied.`
+      return { result: `${what} Ask the user to add it in a terminal with this command, which prompts for the value so the key never lands in shell history:\n${hint}\nThen call use_secret again.` }
+    } catch (err) {
+      return { result: `secret-box could not read the Keychain: ${String((err && err.message) || err).slice(0, 200)}. Nothing was loaded.` }
+    }
+  }).catch(() => ({ result: 'secret-box could not read the Keychain. Nothing was loaded.' }))
 
   // @.env would attach the raw file to your prompt
   on('prompt.mention', { path: /(^|[\\/])\.env(\.[\w.-]+)?$/ }, async ($, e, next) =>
@@ -115,6 +190,16 @@ export function register(on, options) {
     if (!value) return { result: `The user cancelled. ${name} was not saved.` }
 
     try {
+      if (isKeychain) {
+        const account = await defaultAccount($, options)
+        const why = account ? badName('keychainAccount', account) : 'No Keychain account: set the keychainAccount option.'
+        if (why) return { result: `Saving ${name} failed: ${why}` }
+        await saveToKeychain($, name, account, value)
+        const tag = keepSecret(value)
+        $.ui.toast(`${name} saved to Keychain`)
+        // The ONLY things Claude learns: the name, the place, and a placeholder
+        return { result: `The user entered ${name}. It was saved to the macOS Keychain (service ${name}, account ${account}); .env was not touched. You can't see the value. To use it in a command, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. In a later session, load it with use_secret.` }
+      }
       const where = await saveToDotenv($, await $.session.cwd(), name, value)
       const tag = keepSecret(value)
       $.ui.toast(`${name} saved to ${where}`)
