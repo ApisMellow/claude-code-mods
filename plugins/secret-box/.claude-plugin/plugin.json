@@ -16,6 +16,12 @@
       "options": ["auto", "keychain", "dotenv"],
       "default": "auto"
     },
+    "refuseUnmaskable": {
+      "type": "boolean",
+      "title": "Refuse Keychain reads it can't hide",
+      "description": "macOS: refuse a Bash command that reads the Keychain in a way secret-box can't pin to one item or hide (a variable, sudo, dump-keychain, security -i, a value under 8 characters). Off, the command runs and only the detector scans its output",
+      "default": false
+    },
     "keychainAccount": {
       "type": "string",
       "title": "Keychain account",

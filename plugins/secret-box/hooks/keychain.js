@@ -11,21 +11,36 @@ export const SECURITY = '/usr/bin/security'
 // What `security find-*-password` exits with when no item matches
 export const NOT_FOUND = 44
 
-// The Keychain tools exist on macOS only. The mods API has no platform call,
-// so ask uname; anything that can't answer is not a Mac.
-export async function isMacOS($) {
+// The vault can only find a value again where it turns up when it is at least
+// this long (detect.ts indexes values by their first 8 characters)
+export const MIN_HIDDEN = 8
+
+// The redactor's rule (redact.ts SHELL_ACTIVE) for a value it won't put into
+// a Bash command, since it could run there as code. A test pins the two together.
+export const SHELL_ACTIVE = /[\s$`"'\\;&|<>()*?[\]{}#~]|[\x00-\x1f\x7f]/
+
+// Whether this is a Mac: 'mac', 'other', or 'unknown' when it can't be told.
+// The mods API has no platform call: Windows says so in OS; anything else
+// answers uname, run by its full path so nothing on PATH stands in for it.
+export async function platformOf($) {
   try {
-    const r = await $.process.run(['uname', '-s'])
-    return r.exitCode === 0 && r.stdout.trim() === 'Darwin'
-  } catch {
-    return false
+    if ((await $.env.get('OS')) === 'Windows_NT') return 'other'
+  } catch {}
+  for (const uname of ['/usr/bin/uname', '/bin/uname']) {
+    try {
+      const r = await $.process.run([uname, '-s'])
+      const name = r.exitCode === 0 ? r.stdout.trim() : ''
+      if (name) return name === 'Darwin' ? 'mac' : 'other'
+    } catch {}
   }
+  return 'unknown'
 }
 
-// Where the box saves. `auto`, and any value that is neither of the two,
-// means the Keychain on macOS and .env elsewhere.
-export function boxBackend(choice, isMac) {
-  return choice === 'keychain' || choice === 'dotenv' ? choice : isMac ? 'keychain' : 'dotenv'
+// Where the box saves: keychain, dotenv, or unknown when `auto` (and any value
+// that is neither) meets a platform that can't be told. The box saves nowhere then.
+export function boxBackend(choice, platform) {
+  if (choice === 'keychain' || choice === 'dotenv') return choice
+  return platform === 'mac' ? 'keychain' : platform === 'other' ? 'dotenv' : 'unknown'
 }
 
 // A service or account goes into argv and into a command you paste into a
@@ -48,6 +63,13 @@ export function addArgv(service, account, value) {
 // replaces an item that is already there.
 export function addHint(service, account) {
   return `security add-generic-password -U -s ${shellWord(service)} -a ${account ? shellWord(account) : '"$USER"'} -w`
+}
+
+// What Claude writes in a Bash command for a value it can't hold as a
+// placeholder: the shell reads the item as the command runs, so the value
+// never enters the command text. -w prints a printable value as it is.
+export function readCommand(service, account) {
+  return `"$(${SECURITY} find-generic-password -s ${shellWord(service)}${account ? ` -a ${shellWord(account)}` : ''} -w)"`
 }
 
 function shellWord(s) {
@@ -116,13 +138,16 @@ export async function readKeychain($, read) {
   return { value: utf8(m[2]), printed: printedForms(m[2]) }
 }
 
-// The ways security prints a password it shows as hex: the text, -w's
+// The ways a password security shows as hex can turn up: the text, each of its
+// lines long enough to hide (a command may print one line of a PEM), -w's
 // lowercase hex, -g's uppercase hex, and -g's escaped copy, where \ and every
 // byte that is not printable ASCII is written \ooo in octal.
 function printedForms(hex) {
   const bytes = (hex.match(/../g) || []).map((b) => parseInt(b, 16))
   const escaped = bytes.map((n) => (n >= 0x20 && n < 0x7f && n !== 0x5c ? String.fromCharCode(n) : '\\' + n.toString(8).padStart(3, '0'))).join('')
-  return [...new Set([utf8(hex), hex.toLowerCase(), hex, escaped])].filter(Boolean)
+  const text = utf8(hex)
+  const lines = text && text.includes('\n') ? text.split(/\r?\n/).filter((l) => l.length >= MIN_HIDDEN) : []
+  return [...new Set([text, ...lines, hex.toLowerCase(), hex, escaped])].filter(Boolean)
 }
 
 // Bytes to text by way of %XX, since the hooks run with no TextDecoder
@@ -143,47 +168,75 @@ export const READ_ENV = ['USER', 'LOGNAME', 'HOME']
 // The match options of each subcommand: the flags that take a value. -g and -w
 // take none; any other flag (-h) is one we don't follow.
 const MATCH = { generic: 'acCDGjls', internet: 'acCdDjlpPrst' }
+const READS = ['find-generic-password', 'find-internet-password']
+const MENTION = /find-(?:generic|internet)-password|dump-keychain/g
 
 // The Keychain reads a Bash command makes, each a read for readKeychain, or
-// { unknown: why } where we can't know exactly which item it reads: a word
-// only the shell can know ($VAR, a glob, $(...)), a prefix (sudo, env, VAR=x)
-// that could change whose Keychain it reads, a relative keychain file, or a
-// read that isn't a command of its own (inside quotes for `sh -c`).
-// `env` holds READ_ENV's values.
+// { unknown: why } where we can't know exactly which item it reads or what it
+// prints: a word only the shell can know ($VAR, a glob, $(...)), a prefix
+// (sudo, env, VAR=x) that could change whose Keychain it reads, a relative
+// keychain file, `security -i` or `dump-keychain`, or a read that isn't a
+// command of its own (inside quotes for `sh -c`). `env` holds READ_ENV's values.
 export function keychainReads(cmd, env = {}) {
   const text = String(cmd || '')
-  const ctx = { text, env, commands: [] }
+  const ctx = { text, env, commands: [], comments: [] }
   lex(text, 0, '', ctx)
   const reads = new Map()
   const add = (read) => reads.set(JSON.stringify(read), read)
   let seen = 0
   for (const words of ctx.commands) {
-    const at = words.findIndex((w) => w === 'find-generic-password' || w === 'find-internet-password')
-    if (at < 0) continue
-    seen++
-    add(readOf(words, at))
+    seen += words.filter((w) => READS.includes(w) || w === 'dump-keychain').length
+    const read = readOf(words)
+    if (read) add(read)
   }
-  if ((text.match(/find-(?:generic|internet)-password/g) || []).length > seen) add({ unknown: 'part of it could not be parsed' })
+  // A mention outside a comment that isn't a word of its own: inside quotes, or glued to others
+  let code = ''
+  let from = 0
+  for (const [start, end] of ctx.comments) {
+    code += text.slice(from, start)
+    from = end
+  }
+  code += text.slice(from)
+  if ((code.match(MENTION) || []).length > seen) add({ unknown: 'part of it could not be parsed' })
   return [...reads.values()]
 }
 
-// One read from the words of its command, `security [-ilqv] [-p prompt]
-// find-*-password [options] [keychain...]`, the options read as getopt does:
+// What one simple command reads from the Keychain: nothing (undefined), a
+// read, or { unknown }. A read is `security [-lqv] [-p prompt]
+// find-*-password [options] [keychain...]`, its options read as getopt does:
 // bundled (`-wa NAME`), attached (`-sNAME`), and ended by the first word that
 // is not one, which starts the keychain files.
-function readOf(words, at) {
+function readOf(command) {
+  // A keyword that starts a command inside if, for or while is not the command
+  let words = command
+  while (['do', 'then', 'else', 'elif', '!', 'time'].includes(words[0])) words = words.slice(1)
   const unknown = (why) => ({ unknown: why })
   const unknowable = unknown('a word in it is only known when it runs')
-  if (words[0] !== 'security' && words[0] !== SECURITY) return unknown('something other than security runs it')
-  for (let k = 1; k < at; k++) {
-    if (words[k] === '-p') k++
-    else if (!/^-[ilqv]+$/.test(words[k] ?? '')) return unknown('security is given options secret-box does not follow')
+  const at = words.findIndex((w) => READS.includes(w) || w === 'dump-keychain')
+  const runsSecurity = typeof words[0] === 'string' && /(?:^|\/)security$/.test(words[0])
+  if (at < 0 && !runsSecurity) return undefined
+  if (words[0] !== 'security' && words[0] !== SECURITY) {
+    // sudo security, env security, $SEC find-...: security run in a way we can't
+    // follow. `grep find-generic-password` only names the subcommand.
+    const before = words.slice(0, Math.max(at, 1))
+    return before.some((w) => w === null || /(?:^|\/)security$/.test(w)) ? unknown('something other than security runs it') : undefined
   }
+  let k = 1
+  for (; k < words.length; k++) {
+    if (words[k] === '-p') k++
+    else if (/^-[hilqv]+$/.test(words[k] ?? '')) {
+      if (words[k].includes('i')) return unknown('it runs security interactively')
+    } else break
+  }
+  // No command: security reads its commands from its input
+  if (k >= words.length) return unknown('it runs security without a command')
+  if (words[k] === null) return unknowable
+  if (k !== at) return undefined // another command (add-generic-password ...)
+  if (words[at] === 'dump-keychain') return unknown('it dumps the keychain')
   const kind = words[at].slice('find-'.length, -'-password'.length)
   const args = words.slice(at + 1)
   const criteria = []
-  let k = 0
-  for (; k < args.length; k++) {
+  for (k = 0; k < args.length; k++) {
     const a = args[k]
     if (a === null) return unknowable
     if (a === '--') {
@@ -243,7 +296,9 @@ function lex(s, i, stop, ctx) {
       endWord()
       i++
     } else if (c === '#' && word === undefined) {
+      const start = i
       while (i < s.length && s[i] !== '\n') i++
+      ctx.comments.push([start, i])
     } else if (c === '<' || c === '>' || (c === '&' && s[i + 1] === '>')) {
       // A redirection (2>/dev/null, &>log, 2>&1): its fd and its target aren't arguments
       if (typeof word === 'string' && /^\d+$/.test(word)) word = undefined
@@ -261,11 +316,11 @@ function lex(s, i, stop, ctx) {
     } else if (c === '"') {
       i = quoted(s, i + 1, ctx, put)
     } else if (c === '$' || c === '`') {
-      i = expand(s, i, ctx, put)
+      i = expand(s, i, ctx, put, false)
     } else if (c === '~' && word === undefined) {
-      // ~ and ~/x are the home folder; ~name is someone else's
+      // ~ and ~/x are the home folder, unless the command changes HOME; ~name is someone else's
       const tilde = /^~[\w.+-]*/.exec(s.slice(i))[0]
-      put(tilde === '~' ? (ctx.env.HOME ?? null) : null)
+      put(tilde === '~' && !isSet('HOME', ctx.text) ? (ctx.env.HOME ?? null) : null)
       i += tilde.length
     } else if ('*?[]{}'.includes(c) || (c === '=' && word === undefined)) {
       // Globs, braces and zsh's =cmd become text we can't know
@@ -290,7 +345,7 @@ function quoted(s, i, ctx, put) {
       if (s[i + 1] !== '\n') add(s[i + 1])
       i += 2
     } else if (s[i] === '$' || s[i] === '`') {
-      i = expand(s, i, ctx, add)
+      i = expand(s, i, ctx, add, true)
     } else {
       add(s[i])
       i++
@@ -300,10 +355,17 @@ function quoted(s, i, ctx, put) {
   return i + 1
 }
 
+// Whether the command could change a variable: its name as a word of its own
+// anywhere (`USER=x`, `for USER in`, `read USER`, `unset USER`), not as $NAME
+// or ${NAME}. A name that only appears in some other sense makes it unknown too.
+function isSet(name, text) {
+  return new RegExp(`(?<![\\w$]|\\$\\{)${name}(?!\\w)`).test(text)
+}
+
 // $NAME, ${NAME}, $( ) and backticks. Only READ_ENV's names are known, and
-// only while the command doesn't set them itself. The command inside $( ) or
+// only while the command can't change them. The command inside $( ) or
 // backticks is read too; what it prints can't be known.
-function expand(s, i, ctx, put) {
+function expand(s, i, ctx, put, isQuoted) {
   if (s[i] === '`') {
     put(null)
     return lex(s, i + 1, '`', ctx)
@@ -327,9 +389,14 @@ function expand(s, i, ctx, put) {
   const m = /^\$(?:\{(\w+)\}|([A-Za-z_]\w*))/.exec(s.slice(i, i + 130))
   if (m) {
     const name = m[1] || m[2]
-    const isSet = new RegExp(`(?:^|[^\\w])${name}=`).test(ctx.text)
-    put(READ_ENV.includes(name) && !isSet ? (ctx.env[name] ?? null) : null)
-    return i + m[0].length
+    const end = i + m[0].length
+    // zsh changes an unbraced $USER:u (modifiers) and $USER[1] (subscripts)
+    const isChanged = m[2] !== undefined && (s[end] === '[' || (s[end] === ':' && /[A-Za-z]/.test(s[end + 1] ?? '')))
+    let value = READ_ENV.includes(name) && !isChanged && !isSet(name, ctx.text) ? ctx.env[name] : undefined
+    // Unquoted, bash splits a value on IFS and globs it, and zsh does neither
+    if (value !== undefined && !isQuoted && (/[\s*?[\]]/.test(value) || /IFS/.test(ctx.text))) value = undefined
+    put(value ?? null)
+    return end
   }
   if (next === '{') {
     put(null)

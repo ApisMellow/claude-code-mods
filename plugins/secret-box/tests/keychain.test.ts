@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { boxBackend, keychainReads, SECURITY } from '../hooks/keychain'
+import { boxBackend, keychainReads, SECURITY, SHELL_ACTIVE } from '../hooks/keychain'
 import { unmaskable } from '../hooks/register'
 
 const USE = 'mcp__secret-box__use_secret'
@@ -85,13 +85,16 @@ const call = async ($: any, input: Record<string, unknown>) => (await $.tool.cal
 type Opts = {
   items?: Item[]
   platform?: 'Darwin' | 'Linux'
+  uname?: 'both' | 'bin-only' | 'none' // which of /usr/bin/uname and /bin/uname run (both by default)
+  env?: Record<string, string> // in place of USER and HOME
+  toasts?: string[]
   fail?: { exitCode: number; stdout: string; stderr: string } // every security call answers this instead
   deny?: string // every security call is refused (it could not start, or timed out)
   truncated?: boolean // security's answer was cut off
   argvs?: string[][]
   log?: string[]
   seen?: Record<string, unknown>[]
-  output?: string
+  output?: string | ((command: string) => string)
   writes?: { path: string; text: string }[]
   opened?: string[]
   clock?: { sleep: (ms: number) => Promise<void> }
@@ -106,7 +109,10 @@ function mac(on: any, opts: Opts = {}) {
     const answer = (r: { exitCode: number; stdout: string; stderr: string }) => ({
       value: { isStdoutTruncated: false, isStderrTruncated: Boolean(opts.truncated), ...r },
     })
-    if (e.argv[0] === 'uname') return answer({ exitCode: 0, stdout: `${opts.platform ?? 'Darwin'}\n`, stderr: '' })
+    if (e.argv[0] === '/usr/bin/uname' || e.argv[0] === '/bin/uname') {
+      const runs = opts.uname === 'none' ? false : opts.uname === 'bin-only' ? e.argv[0] === '/bin/uname' : true
+      return runs ? answer({ exitCode: 0, stdout: `${opts.platform ?? 'Darwin'}\n`, stderr: '' }) : { deny: `${e.argv[0]} failed to start: ENOENT` }
+    }
     if (e.argv[0] === 'sleep') await opts.clock?.sleep(300)
     if (e.argv[0] !== SECURITY) return answer({ exitCode: 0, stdout: '', stderr: '' })
     if (opts.deny) return { deny: opts.deny }
@@ -117,7 +123,8 @@ function mac(on: any, opts: Opts = {}) {
   on('tool.call', (_$: unknown, e: Record<string, unknown>) => {
     opts.seen?.push({ ...e })
     opts.log?.push(`tool ${String(e.tool)}`)
-    return { result: opts.output ?? 'ran' }
+    const out = opts.output
+    return { result: typeof out === 'function' ? out(String(e.command ?? '')) : out ?? 'ran' }
   })
   on('session.cwd', () => ({ value: '/repo' }))
   on('fs.exists', () => ({ value: false }))
@@ -125,14 +132,17 @@ function mac(on: any, opts: Opts = {}) {
     opts.writes?.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$: unknown, e: { text: string }) => {
+    opts.toasts?.push(String(e.text))
+    return { value: undefined }
+  })
   on('session.surfaces', () => ({ value: ['terminal'] }))
   on('ui.open', (_$: unknown, e: { id: string }) => {
     opts.opened?.push(e.id)
     return { value: { isPlaced: true } }
   })
   on('ui.close', () => ({ value: undefined }))
-  mock.env(on, { USER: 'tester', HOME })
+  mock.env(on, opts.env ?? { USER: 'tester', HOME })
 }
 
 const securityCalls = (argvs: string[][]) => argvs.filter((a) => a[0] === SECURITY)
@@ -185,18 +195,79 @@ const VALUES: [string, string][] = [
   ['UTF-8', 'caf\u00e9-\u00fc-' + hex(9)],
   ['a quote and a backslash', 'he said "hi" \\ ' + hex(10)],
 ]
-for (const [name, VALUE] of VALUES) {
-  test(`use_secret restores a value with ${name} exactly`, async ($, on) => {
+// No shell character: a placeholder, restored exactly
+for (const [name, VALUE] of [VALUES[0]!, VALUES[4]!]) {
+  test(`use_secret gives a value with ${name} a placeholder, restored exactly`, async ($, on) => {
     const seen: Record<string, unknown>[] = []
     mac(on, { items: [{ s: 'svc', value: VALUE }], seen })
+    expect(String((await call($, { tool: USE, service: 'svc' })).result)).toContain('Never write the value into a file')
     expect(await restored($, seen, { service: 'svc' })).toBe(VALUE)
   })
 }
 
-test('a multi-line value from use_secret is refused by Bash, as the README says', async ($, on) => {
-  mac(on, { items: [{ s: 'pem', value: 'line1-' + hex(11) + '\nline2' }] })
-  const tag = String((await call($, { tool: USE, service: 'pem' })).result).match(TAG)![0]
-  expect(String((await call($, { tool: 'Bash', command: `printf '%s' ${tag}` })).deny)).toContain('shell characters')
+// A printable value with a space or a shell character: the redactor would
+// refuse its placeholder in Bash and steer Claude to write it to a file, so
+// use_secret hands out no placeholder, only the command that reads it
+const SHELLY: [string, string][] = [
+  ['a space', 'pass word ' + hex(25)],
+  ['a $', 'pa$$-' + hex(26)],
+  ['an &', 'a&b-' + hex(27)],
+  ['a #', 'a#b-' + hex(28)],
+  ['a *', 'a*b-' + hex(29)],
+  ['quotes and a backslash', VALUES[5]![1]],
+]
+for (const [name, VALUE] of SHELLY) {
+  test(`use_secret gives a value with ${name} no placeholder, only the command that reads it`, async ($, on) => {
+    mac(on, { items: [{ s: "Bob's site", a: 'bob x', value: VALUE }] })
+    const r = String((await call($, { tool: USE, service: "Bob's site", account: 'bob x' })).result)
+    const command = `"$(${SECURITY} find-generic-password -s 'Bob'\\''s site' -a 'bob x' -w)"`
+    expect(r).not.toMatch(TAG)
+    expect(r).not.toContain(VALUE)
+    expect(r).toContain(command)
+    expect(r).toContain('Never write the value into a file')
+    // That command is a read the pre-load pins to this very item
+    expect(keychainReads(`printf '%s' ${command} | tee out.txt`, ENV)).toEqual([{ kind: 'generic', criteria: [['-s', "Bob's site"], ['-a', 'bob x']], keychains: [] }])
+  })
+}
+
+test('the command use_secret gives runs with the value out of the command and out of the output', async ($, on) => {
+  const VALUE = 'pass word ' + hex(30)
+  const argvs: string[][] = []
+  const seen: Record<string, unknown>[] = []
+  mac(on, { items: [{ s: 'site', value: VALUE }], argvs, seen, output: VALUE })
+  const command = String((await call($, { tool: USE, service: 'site' })).result).match(/"\$\(.*? -w\)"/)![0]
+  const r = await call($, { tool: 'Bash', command: `printf '%s' ${command} | tee out.txt` })
+  expect(r.deny).toBeUndefined()
+  expect(String(seen.at(-1)!.command)).not.toContain(VALUE)
+  expect(String(r.result)).not.toContain(VALUE)
+  expect(String(r.result)).toMatch(TAG)
+  // use_secret's read, then the pre-load's read of the same item
+  expect(securityCalls(argvs)).toEqual([[SECURITY, 'find-generic-password', '-s', 'site', '-g'], [SECURITY, 'find-generic-password', '-s', 'site', '-g']])
+})
+
+// A newline, a tab, or a non-ASCII letter beside a shell character: -w prints
+// hex, so no command can read it either; it is not handed out for Bash at all
+for (const [name, VALUE] of [VALUES[1]!, VALUES[2]!, VALUES[3]!, ['short lines', 'abcd\nefgh'], ['a non-ASCII letter and a space', 'café x-' + hex(31)]] as [string, string][]) {
+  test(`use_secret won't hand out a value with ${name} for Bash, and still hides it exactly`, async ($, on) => {
+    mac(on, { items: [{ s: 'svc', value: VALUE }], output: VALUE })
+    const r = String((await call($, { tool: USE, service: 'svc' })).result)
+    expect(r).not.toMatch(TAG)
+    expect(r).not.toContain('$(')
+    expect(r).toContain('Never write the value into a file')
+    expect(r).toContain('base64')
+    // Decoded exactly: printed whole, the value comes back hidden
+    expect(String((await call($, { tool: 'Bash', command: 'cat x' })).result)).not.toContain(VALUE)
+  })
+}
+
+test("SHELL_ACTIVE is the redactor's rule: a value it flags is exactly one Bash refuses", async ($, on) => {
+  const values = Array.from({ length: 127 }, (_, i) => `pin-${hex(40).slice(0, 10)}${String.fromCharCode(i + 1)}tail`)
+  mac(on, { items: values.map((value, i) => ({ s: `pin${i}`, value })), output: (command) => (/-s pin(\d+)/.test(command) ? values[Number(RegExp.$1)]! + '\n' : '') })
+  for (const [i, value] of values.entries()) {
+    const tag = String((await call($, { tool: 'Bash', command: `security find-generic-password -s pin${i} -w` })).result).match(TAG)![0]
+    const r = await call($, { tool: 'Bash', command: `printf '%s' ${tag}` })
+    expect(r.deny !== undefined, `char ${i + 1}`).toBe(SHELL_ACTIVE.test(value))
+  }
 })
 
 test('after use_secret, the hex security prints for the value comes back hidden too', async ($, on) => {
@@ -315,6 +386,26 @@ const READS: [string, string, unknown[]][] = [
   ["$'...'", "security find-generic-password -s $'svc' -w", [U]],
   ['an unterminated quote', 'security find-generic-password -s "svc -w', [U]],
   ['not a read', 'security add-generic-password -s svc -a me -w', []],
+  // The command changes a variable it names, or the shell would change the value
+  ['a for loop that sets USER', 'for USER in a b\ndo\nsecurity find-generic-password -s x -a "$USER" -w\ndone', [U]],
+  ['while read USER', 'while read USER; do security find-generic-password -s x -a "$USER" -w; done < users', [U]],
+  ['unset USER', 'unset USER; security find-generic-password -s x -a "$USER" -w', [U]],
+  ['export HOME, then ~/', 'export HOME=/tmp/h; security find-generic-password -s x -w ~/k.keychain-db', [U]],
+  ['a zsh modifier', 'security find-generic-password -s x -a $USER:u -w', [U]],
+  ['a zsh subscript', 'security find-generic-password -s x -a "$USER[1,3]" -w', [U]],
+  ['an unquoted $USER with IFS set', 'IFS=e; security find-generic-password -s x -a $USER -w', [U]],
+  ['a quoted $USER with IFS set', 'IFS=e; security find-generic-password -s x -a "$USER" -w', [g([['-s', 'x'], ['-a', 'tester']])]],
+  ['a keyword before security', 'if true; then security find-generic-password -s x -w; fi', [g([['-s', 'x']])]],
+  // security run so that what it prints can't be pinned down
+  ['dump-keychain', 'security dump-keychain -d', [U]],
+  ['dump-keychain after a global option', 'security -q dump-keychain', [U]],
+  ['sudo dump-keychain', 'sudo security dump-keychain -d', [U]],
+  ['security -i reading commands', 'security -i < commands.txt', [U]],
+  ['security with no command', 'security', [U]],
+  ['a subcommand spelled around', 'security find-generic-pass\\word -s svc -w', [g([['-s', 'svc']])]],
+  // Only naming the subcommand reads nothing
+  ['a comment that names the subcommand', 'ls -la # security find-generic-password -s svc -w', []],
+  ['grep for the subcommand', 'grep -rn find-generic-password hooks/', []],
 ]
 for (const [name, command, reads] of READS) {
   test(`keychainReads: ${name}`, async () => {
@@ -332,7 +423,7 @@ test('a direct Keychain read in Bash is loaded before it runs, and its output co
   expect(String(r.result)).toMatch(TAG)
   expect(securityCalls(argvs)).toEqual([[SECURITY, 'find-generic-password', '-s', 'secret-box-test', '-g']])
   // uname, then the item, then the command
-  expect(log).toEqual(['process.run uname -s', `process.run ${SECURITY} find-generic-password`, 'tool Bash'])
+  expect(log).toEqual(['process.run /usr/bin/uname -s', `process.run ${SECURITY} find-generic-password`, 'tool Bash'])
 })
 
 // Two items share a service; the command reads the SECOND one. Each of these
@@ -383,25 +474,73 @@ test('bare hex is left alone by the detector, so the pre-load is what hides a di
   expect(String((await call($, { tool: 'Bash', command: 'cat digest.txt' })).result)).toContain(VALUE)
 })
 
-test('the policy for reads it cannot pin down lets them run (REFUSE_UNMASKABLE is false)', async () => {
-  expect(unmaskable('a word in it is only known when it runs')).toBeUndefined()
+test('a read spelled around find-generic-password is still loaded and hidden', async ($, on) => {
+  const VALUE = hex(32)
+  mac(on, { items: [{ s: 'svc', value: VALUE }], output: wOutput(VALUE) })
+  const r = String((await call($, { tool: 'Bash', command: 'security find-generic-pass\\word -s svc -w' })).result)
+  expect(r).not.toContain(VALUE)
+  expect(r).toMatch(TAG)
 })
 
-test('a read it cannot pin down runs as written, without a fetch', async ($, on) => {
-  const argvs: string[][] = []
-  mac(on, { argvs })
-  expect(await call($, { tool: 'Bash', command: 'security find-generic-password -s "$SVC" -w' })).toEqual({ result: 'ran' })
-  expect(securityCalls(argvs)).toEqual([])
+test('a command that prints one line of a multi-line value gets that line hidden', async ($, on) => {
+  // Each line is bare hex, which the detector alone leaves alone
+  const VALUE = hex(33) + '\n' + hex(34)
+  mac(on, { items: [{ s: 'pem', value: VALUE }], output: hex(34) + '\n' })
+  const r = String((await call($, { tool: 'Bash', command: 'security find-generic-password -s pem -w | xxd -r -p | tail -1' })).result)
+  expect(r).not.toContain(hex(34))
+  expect(r).toMatch(TAG)
 })
 
-test('a pre-load that fails still lets the command run', async ($, on) => {
-  mac(on, { deny: 'timed out' })
-  expect(await call($, { tool: 'Bash', command: 'security find-generic-password -s svc -w' })).toEqual({ result: 'ran' })
+test('keychainReads: $USER, $LOGNAME and $HOME as the shell would hand them over', async () => {
+  const env = { USER: 'tester', LOGNAME: 'tlog', HOME: '/Users/Jane Doe' }
+  const reads = (command: string) => keychainReads(command, env).map((r: any) => (r.unknown ? U : r))
+  expect(reads('security find-generic-password -s x -a "$LOGNAME" -w')).toEqual([g([['-s', 'x'], ['-a', 'tlog']])])
+  // A HOME with a space: whole when quoted or as ~, split by bash when bare
+  expect(reads('security find-generic-password -s x -w "$HOME/k.keychain-db"')).toEqual([g([['-s', 'x']], ['/Users/Jane Doe/k.keychain-db'])])
+  expect(reads('security find-generic-password -s x -w ~/k.keychain-db')).toEqual([g([['-s', 'x']], ['/Users/Jane Doe/k.keychain-db'])])
+  expect(reads('security find-generic-password -s x -w $HOME/k.keychain-db')).toEqual([U])
 })
 
-test('a locked keychain still lets the command run', async ($, on) => {
-  mac(on, { fail: { exitCode: 36, stdout: '', stderr: 'security: SecKeychainSearchCopyNext: User interaction is not allowed.' } })
-  expect(await call($, { tool: 'Bash', command: 'security find-generic-password -s svc -w' })).toEqual({ result: 'ran' })
+// Every read the pre-load can't promise to hide goes to unmaskable(): the
+// refuseUnmaskable option refuses it, and by default it runs
+const UNMASKABLE: [string, Opts, string][] = [
+  ['a read it cannot parse', {}, 'security find-generic-password -s "$SVC" -w'],
+  ['a variable the command sets', {}, 'unset USER; security find-generic-password -s x -a "$USER" -w'],
+  ['dump-keychain', {}, 'security dump-keychain -d'],
+  ['security -i', {}, 'security -i < commands.txt'],
+  ['a read inside sh -c', {}, "sh -c 'security find-generic-password -s svc -w'"],
+  ['a value too short to hide', { items: [{ s: 'pin', value: 'abc12' }] }, 'security find-generic-password -s pin -w'],
+  ['a fetch that fails', { deny: 'timed out' }, 'security find-generic-password -s svc -w'],
+  ['a locked keychain', { fail: { exitCode: 36, stdout: '', stderr: 'User interaction is not allowed.' } }, 'security find-generic-password -s svc -w'],
+]
+for (const [name, opts, command] of UNMASKABLE) {
+  test(`refuseUnmaskable on: ${name} is refused before it runs`, { options: { refuseUnmaskable: true } }, async ($, on) => {
+    const seen: Record<string, unknown>[] = []
+    mac(on, { ...opts, seen })
+    expect(String((await call($, { tool: 'Bash', command })).deny)).toContain("so what it prints can't be hidden")
+    expect(seen).toEqual([])
+  })
+  test(`refuseUnmaskable off (default): ${name} runs`, async ($, on) => {
+    mac(on, opts)
+    expect(await call($, { tool: 'Bash', command })).toEqual({ result: 'ran' })
+  })
+}
+
+test('refuseUnmaskable on: reads it can pin down and hide, missing items, and mere mentions all run', { options: { refuseUnmaskable: true } }, async ($, on) => {
+  mac(on, { items: [{ s: 'svc', value: hex(35) }] })
+  for (const command of [
+    'security find-generic-password -s svc -w',
+    'security find-generic-password -s missing -w',
+    'grep -rn find-generic-password hooks/',
+    'ls # security dump-keychain -d',
+  ]) {
+    expect(await call($, { tool: 'Bash', command })).toEqual({ result: 'ran' })
+  }
+})
+
+test('unmaskable(): undefined when off, a refusal naming why when on', async () => {
+  expect(unmaskable('it dumps the keychain', false)).toBeUndefined()
+  expect(unmaskable('it dumps the keychain', true)).toEqual({ deny: "secret-box: this command reads the Keychain, but it dumps the keychain, so what it prints can't be hidden. Use use_secret instead." })
 })
 
 // ------------------------------------------------------------------ platforms
@@ -453,9 +592,47 @@ test('off macOS the pre-load does nothing and use_secret says it needs macOS', a
 })
 
 test('boxBackend: auto and unknown values follow the platform; a named backend is kept', async () => {
-  expect([boxBackend('auto', true), boxBackend('auto', false)]).toEqual(['keychain', 'dotenv'])
-  expect([boxBackend(undefined, true), boxBackend('Keychain ', true), boxBackend('weird', false)]).toEqual(['keychain', 'keychain', 'dotenv'])
-  expect([boxBackend('keychain', false), boxBackend('dotenv', true)]).toEqual(['keychain', 'dotenv'])
+  expect(['mac', 'other', 'unknown'].map((p) => boxBackend('auto', p))).toEqual(['keychain', 'dotenv', 'unknown'])
+  expect([boxBackend(undefined, 'mac'), boxBackend('Keychain ', 'mac'), boxBackend('weird', 'other')]).toEqual(['keychain', 'keychain', 'dotenv'])
+  expect([boxBackend('keychain', 'other'), boxBackend('dotenv', 'unknown')]).toEqual(['keychain', 'dotenv'])
+})
+
+test('uname runs by its full path', async ($, on) => {
+  const argvs: string[][] = []
+  mac(on, { argvs, items: [{ s: 'svc', value: hex(36) }] })
+  await call($, { tool: USE, service: 'svc' })
+  expect(argvs[0]).toEqual(['/usr/bin/uname', '-s'])
+})
+
+test('with no /usr/bin/uname, /bin/uname answers', async ($, on) => {
+  const specs = await registered($, on, { uname: 'bin-only' })
+  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+})
+
+test("Windows says so in OS, and uname never runs", async ($, on) => {
+  const argvs: string[][] = []
+  const specs = await registered($, on, { env: { OS: 'Windows_NT', USER: 'tester' }, argvs })
+  expect(specs.map((s) => s.name)).toEqual(['request_secret'])
+  expect(specs[0]!.description).toBe(UPSTREAM_DESCRIPTION)
+  expect(argvs.filter((a) => a[0]!.endsWith('uname'))).toEqual([])
+})
+
+test("when uname can't answer, use_secret stays on and a toast says why", async ($, on) => {
+  const toasts: string[] = []
+  const specs = await registered($, on, { uname: 'none', toasts })
+  expect(specs.map((s) => s.name)).toEqual(['request_secret', 'use_secret'])
+  expect(toasts.join('\n')).toContain("couldn't tell whether this is a Mac")
+})
+
+test("when uname can't answer, the box with backend auto writes nothing", async ($, on) => {
+  const opened: string[] = []
+  const writes: { path: string; text: string }[] = []
+  const argvs: string[][] = []
+  mac(on, { uname: 'none', opened, writes, argvs })
+  const r = String((await call($, { tool: BOX, name: 'STRIPE_SECRET_KEY', reason: 'x' })).result)
+  expect(r).toContain("couldn't tell whether this is a Mac")
+  expect(r).toContain('nothing was written')
+  expect([opened, writes, securityCalls(argvs)]).toEqual([[], [], []])
 })
 
 // ------------------------------------------------------------------- the box
@@ -526,6 +703,19 @@ test('backend dotenv on macOS is the upstream box', { options: { backend: 'doten
 
 test('off macOS the box defaults to dotenv: the upstream box', async ($, on) => {
   await expectUpstreamBox($, on, { platform: 'Linux' })
+})
+
+test("when uname can't answer, backend dotenv set by hand is still the upstream box", { options: { backend: 'dotenv' } }, async ($, on) => {
+  await expectUpstreamBox($, on, { uname: 'none' })
+})
+
+test('a value with a space typed into the box gets the read-it command, not a placeholder', async ($, on) => {
+  const VALUE = 'pass word ' + hex(37)
+  const r = String((await fillBox($, on, VALUE, {})).result)
+  expect(r).not.toMatch(TAG)
+  expect(r).not.toContain(VALUE)
+  expect(r).toContain(`"$(${SECURITY} find-generic-password -s STRIPE_SECRET_KEY -a tester -w)"`)
+  expect(r).toContain('Never write the value into a file')
 })
 
 test('backend keychain off macOS is refused before the box opens', { options: { backend: 'keychain' } }, async ($, on) => {

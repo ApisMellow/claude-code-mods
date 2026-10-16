@@ -51,7 +51,7 @@ Accept the trust prompt (mods don't load in an untrusted folder). Tell Claude `b
 
 ## Keychain backend (macOS)
 
-On macOS the box saves a key to the Keychain as a generic password by default (`backend: auto`): the name Claude asked for is the service, and your macOS user name is the account (set `keychainAccount` to change it). Nothing is written to `.env` or `.gitignore`. Set `backend` to `dotenv` for the `.env` behavior. `use_secret` and the masking of direct reads below are on whenever the Mac is, whatever `backend` says. On other systems they don't exist and `auto` means `dotenv`. `.env` files are still learned in both modes, so projects that keep one stay covered.
+On macOS the box saves a key to the Keychain as a generic password by default (`backend: auto`): the name Claude asked for is the service, and your macOS user name is the account (set `keychainAccount` to change it). Nothing is written to `.env` or `.gitignore`. Set `backend` to `dotenv` for the `.env` behavior. `use_secret` and the masking of direct reads below are on whenever the Mac is, whatever `backend` says. On other systems they don't exist and `auto` means `dotenv`. The mod asks `/usr/bin/uname` which system it is on. If uname can't answer, `use_secret` stays on, a toast says so, and with `auto` the box saves nothing until you set `backend` to `keychain` or `dotenv`. `.env` files are still learned in both modes, so projects that keep one stay covered.
 
 **Adding a key by hand.** In a terminal:
 
@@ -61,11 +61,22 @@ security add-generic-password -s OPENAI_API_KEY -a "$USER" -w
 
 With `-w` last, `security` prompts for the value, so the key never lands in your shell history. Add `-U` to replace an item that is already there.
 
-**How Claude asks for it.** Claude calls `secret-box - use_secret` with the service name, and the account when several items share that service. The mod runs `/usr/bin/security find-generic-password -s NAME -g` itself, by argv with no shell, and hands Claude only a placeholder. The items you already have work as they are, with no required prefix. If the item is missing, Claude gets the `security add-generic-password -U` command above to pass on to you; if the keychain is locked or access was refused, it asks you to unlock it or allow access. Ask for it by name if Claude doesn't think of it: `use_secret OPENAI_API_KEY and check the key works`.
+**How Claude asks for it.** Claude calls `secret-box - use_secret` with the service name, and the account when several items share that service. The mod runs `/usr/bin/security find-generic-password -s NAME -g` itself, by argv with no shell, and never hands Claude the value. Usually Claude gets a placeholder. A value with a space or a shell character (`$`, `&`, `#`, quotes, common in website passwords) can't go into a command as a placeholder, so Claude gets `"$(/usr/bin/security find-generic-password -s NAME -w)"` to put where the value goes. The shell reads the item as the command runs, so the value never appears in the command text, and the mod hides what the command prints. Either way, Claude is told never to write the value into a file. The items you already have work as they are, with no required prefix. If the item is missing, Claude gets the `security add-generic-password -U` command above to pass on to you; if the keychain is locked or access was refused, it asks you to unlock it or allow access. Ask for it by name if Claude doesn't think of it: `use_secret OPENAI_API_KEY and check the key works`.
 
-**A direct read is masked too.** If Claude runs `security find-generic-password … -w` (or `-g`, or `find-internet-password`) in Bash anyway, the mod first reads the item that command reads, with the same match options (`-s`, `-a`, `-l` and the rest) and keychain files, and hides every form `security` prints it in. For a value with a newline, a tab or any non-ASCII character, `-w` prints hex instead of the text, and that is hidden as well. `$USER`, `$LOGNAME`, `$HOME` and `~/` are resolved. This turns the usual accident into a harmless one; it isn't a wall. A read the mod can't pin down to one item runs as written, and only the detector scans its output, which doesn't hide bare hex. That covers a variable it doesn't hold, `sudo` or another prefix, a keychain file given by a relative path, and a read inside a quoted `sh -c` script.
+**A direct read is masked too.** If Claude runs `security find-generic-password … -w` (or `-g`, or `find-internet-password`) in Bash anyway, the mod first reads the item that command reads, with the same match options (`-s`, `-a`, `-l` and the rest) and keychain files, and hides every form `security` prints it in. For a value with a newline, a tab or any non-ASCII character, `-w` prints hex instead of the text, and that is hidden as well, along with each line of 8 characters or more. `$USER`, `$LOGNAME`, `$HOME` and `~/` are resolved unless the command could change them. Every Bash command is checked, however it spells the read. This turns the usual accident into a harmless one; it isn't a wall.
 
-**Multi-line values.** A value with a newline (a PEM key, say) can't be put into a Bash command: the redactor refuses to restore any value holding a newline or shell characters. Writing it to a file with Write would put a copy in file history (below). Instead, save it base64-encoded, `security add-generic-password -U -s NAME -a "$USER" -w "$(base64 -i key.pem)"`, and decode it straight into what needs it: `printf '%s' [REDACTED-SECRET-…] | base64 -d | ssh-add -`. Don't let the decoded text print. The vault knows the base64 form, not the decoded one.
+Some reads can't be pinned to one item or hidden. By default these run as written, and only the detector scans their output, which doesn't hide bare hex. Set `refuseUnmaskable` to refuse them instead. They are:
+
+- a variable the mod doesn't hold, or one the command sets
+- `sudo` or another prefix
+- a keychain file given by a relative path
+- a read inside a quoted `sh -c` script
+- `security -i`
+- `dump-keychain`
+- a value under 8 characters
+- a failed fetch or a locked keychain
+
+**Multi-line values.** A value with a newline (a PEM key, say) can't be put into a Bash command: the redactor won't restore it, and `-w` prints it as hex, so the read-it command above won't work either. `use_secret` says so and hands out nothing for Bash. Writing it to a file with Write would put a copy in file history (below). Instead, save it base64-encoded, `security add-generic-password -U -s NAME -a "$USER" -w "$(base64 -i key.pem)"`, and decode it straight into what needs it: `printf '%s' [REDACTED-SECRET-…] | base64 -d | ssh-add -`. Don't let the decoded text print. The vault knows the base64 form, not the decoded one.
 
 **Threat model.** The goal is to keep keys out of anything written to disk under `~/.claude/` (transcripts, file history) and out of plaintext files in your projects. The concern is an attacker on the machine, an exfiltrated transcript, or device-management/DLP software finding a key on disk. It is not a sandbox against the agent: deliberate exfiltration is out of scope (see Limits).
 
@@ -83,6 +94,7 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 | :- | :- | :- |
 | `backend` | `auto` | Where the box saves: `auto` (the Keychain on macOS, `.env` elsewhere), `keychain` (macOS only; refused elsewhere rather than falling back to a plaintext file) or `dotenv` (the project `.env`) |
 | `keychainAccount` | empty | The account the box saves Keychain items under. Empty means your macOS user name |
+| `refuseUnmaskable` | `false` | macOS: refuse a Bash command that reads the Keychain in a way the mod can't pin to one item or hide (listed under Keychain backend), instead of letting it run |
 | `secrets` | `true` | Hide secrets in tool output and prompts |
 | `pii` | `false` | Hide email addresses and public IP addresses |
 | `hideEmails` | `true` | With `pii` on, also hide emails; turn off to hide only IPs |
