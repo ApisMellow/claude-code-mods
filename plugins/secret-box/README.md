@@ -151,18 +151,22 @@ Claude Code checks a call's permission after secret-box has put the real values 
 
 1. Claude Code's own verdict comes first. If your rules, the mode or a hook allow or deny the call, that stands.
 2. If Claude Code would ask, secret-box asks your permission rules about the call as written, placeholders and all. A rule that allows or denies it decides.
-3. If that still asks, secret-box asks you in its own dialog. It shows the tool, the call as written and the names of the keys it uses, never their values, with Allow and Deny. Anything but Allow, closing the dialog included, refuses the call.
-4. With no one to ask (`claude -p`), Claude Code's verdict goes on unchanged.
+3. With no one to ask (`claude -p`), Claude Code's verdict goes on unchanged.
+4. In plan mode and dontAsk mode, Claude Code's verdict goes on too, so the mode settles the call as it would any other. secret-box never allows a call there.
+5. Otherwise secret-box allows the call, so you aren't asked about every command that uses a key. The key is filled in only while the call runs, and nothing you or Claude see shows it.
+6. With `ownPrompt` on, secret-box asks you instead, in its own short prompt: the call as written, with placeholders, and the keys it uses, never their values. Anything but Allow, closing the prompt included, refuses the call. It also asks, whatever `ownPrompt` says, if it hasn't yet learned which permission mode the session is in.
 
-secret-box never allows a call on its own judgment. An allow comes from Claude Code, from your rules or from you, so a placeholder is never a way around a check. Calls with no placeholder put back are untouched. Set `ownApproval` to `false` to have Claude Code check the call with the real values in it, as before.
+The tradeoff of step 5: in auto mode the classifier doesn't review a call secret-box allows, so it skips the rest of that command too, not only the key. Turn `ownPrompt` on if you'd rather approve each one. Calls with no placeholder put back are untouched. Set `ownApproval` to `false` to have Claude Code check the call with the real values in it, as before.
 
-**Allow rules for running an app.** A command that runs an app through `keychain-env` holds no placeholder, so Claude Code checks it as usual, and auto mode's classifier may refuse it as credential access. Add a narrow allow rule for each such command, one exact command per rule, in the project's `.claude/settings.local.json` (not committed: the runner's path is this machine's):
+**A placeholder from before a reload.** The vault lives in memory, so when secret-box reloads (a new session, or an edit to the mod while it runs) every placeholder it handed out stops standing for anything. A call that still uses one is refused before it runs, and Claude is told to load the key again with `use_secret`. Left alone, the command would run with the placeholder's own text. A placeholder that already sits in a file as text can still be edited out of it.
+
+**An allow rule for running an app.** A command that runs an app through `keychain-env` holds no placeholder, so Claude Code checks it as usual, and auto mode's classifier may refuse it as credential access. Add one allow rule for the runner in the project's `.claude/settings.local.json` (not committed: the runner's path is this machine's):
 
 ```json
-{ "permissions": { "allow": ["Bash(/path/to/secret-box/bin/keychain-env -- npm start)"] } }
+{ "permissions": { "allow": ["Bash(/path/to/secret-box/bin/keychain-env:*)"] } }
 ```
 
-Claude gives you the exact line, with the runner's absolute path filled in. Don't allow `keychain-env:*`: it would let any command run with every key the project's `.env` points to.
+Claude gives you the exact line, with the runner's absolute path filled in. The rule covers every command run through the runner, so you aren't asked again for each one.
 
 ## How Claude finds all this
 
@@ -186,7 +190,8 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 | `redactPrivateIps` | `false` | With `pii` on, also hide private and reserved IPs recognized by the detector |
 | `restoreInToolInputs` | `true` | Turn placeholders back into real values before a tool runs |
 | `restoreTools` | `Bash,Write,Edit,MultiEdit,NotebookEdit` | The tools that may receive a real value. Tools that send data off the machine are left out on purpose |
-| `ownApproval` | `true` | Decide the approval of a call that got real values on the call as written: your rules first, then secret-box's own Allow/Deny dialog (see Approving calls that use a key). It never allows on its own. Off, Claude Code checks the call with the real values in it |
+| `ownApproval` | `true` | Decide the approval of a call that got real values on the call as written: your rules first, then an allow, or secret-box's own prompt with `ownPrompt` on (see Approving calls that use a key). In plan and dontAsk modes Claude Code's verdict stands. Off, Claude Code checks the call with the real values in it |
+| `ownPrompt` | `false` | With `ownApproval` on, ask you in secret-box's own prompt before a call that uses a key, when your rules don't decide it. Off, such a call is allowed, and auto mode's classifier skips the whole command |
 | `notify` | `true` | A count on the tool row, a toast on a prompt |
 | `minEntropy` | `3.6` | Bits per character for the high-entropy test |
 | `minLength` | `24` | Shortest token the high-entropy test looks at |
@@ -205,6 +210,7 @@ Stripe object ids (`price_`, `prod_`, `cus_`, `pk_live_` and so on) are public a
 - The box is a pane opened with `$.ui.open` and an `Input`. The element has no password mode, so the mod masks it itself: the field draws `•` repeated, and `onInput` works out what was typed, pasted or deleted and keeps the real value in a module variable. A hook may only run for 10 seconds of its own time, but time inside a mods API call doesn't count, so it waits for you in short `$.process.run(['sleep', '0.3'])` calls (on Windows, which has no `sleep`, a 300 ms `node -e` wait, or a `ping` of 1 second where node is not installed).
 - On Enter the mod writes `.env` with `$.fs` and hands the value to the vault, which answers with the placeholder. The vault maps each value to a random placeholder that stays stable within the session, and lives in memory only.
 - The redaction is [transcript-redactor](../transcript-redactor), in `hooks/redact.ts` and `hooks/detect.ts`. `register.jsx` calls its `register` and adds only what secret-box needs. Its hooks hide keys in your prompt, CLAUDE.md, tool results, `@` files, the engine's own attachments and subagent tasks, and put real values back into `Bash`, `Write` and `Edit`. A value restored into a command is hidden again if the command prints it. `redact.ts` adds one thing to the redactor: its `tool.call` hook records each call it filled (by `tool_use_id`, the call as written and the placeholders used) until the call ends, and a `tool.check` hook answers those calls' permission check as described under Approving calls that use a key.
+- secret-box's own tools answer you in one short line (`Loaded openai from the Keychain as [REDACTED-SECRET-1a2b3c4d].`). The instructions for Claude ride in the answer's context, which Claude reads and you don't see. A refusal can't carry context, so a `ui.render` hook on `ToolResult` draws each of secret-box's refusals as one calm line in your view instead; Claude reads the full text.
 - Before a tool reads a `.env` file, a `tool.call` hook reads it too and gives every value whose name says secret (`KEY`, `TOKEN`, `SECRET`, `PASSWORD` and the like) to the vault. So even a weak value the detector would miss, like a word password, comes back as a placeholder.
 - A `tool.call` hook on `Bash` refuses `git add` of a `.env` file and runs `git diff --cached --name-only` before any `git commit`. A `prompt.mention` hook refuses `@.env`, which would attach the raw file.
 - Every hook that guards has a `.catch` that fails closed: if a scan breaks, the output is withheld or the call is refused.
@@ -212,7 +218,7 @@ Stripe object ids (`price_`, `prod_`, `cus_`, `pk_live_` and so on) are public a
 ## Limits
 
 - **It hides what Claude reads, not what Claude does.** With a placeholder Claude can still run a command that transforms the key (`base64`, `rev`) or sends it somewhere, and the transformed output isn't recognized. This stops keys from landing in the transcript by accident. It is not a sandbox against a model that is trying to leak one.
-- **In auto mode, Claude Code's classifier blocks `cat .env`** and `source .env` as credential access before secret-box sees them. In default mode, approve the read and it comes back masked. Without `ownApproval`, a placeholder command is no sure way through either: in testing the classifier read the command with the real key in it, took about 25 s, allowed it once and then refused it as credential materialization. A command that reads a key by name (`"$(security … -w)"`) was refused the same way. In auto mode, keep `ownApproval` on (see Approving calls that use a key) and add a narrow allow rule for each `keychain-env` command.
+- **In auto mode, Claude Code's classifier blocks `cat .env`** and `source .env` as credential access before secret-box sees them. In default mode, approve the read and it comes back masked. Without `ownApproval`, a placeholder command is no sure way through either: in testing the classifier read the command with the real key in it, took about 25 s, allowed it once and then refused it as credential materialization. A command that reads a key by name (`"$(security … -w)"`) was refused the same way. In auto mode, keep `ownApproval` on (see Approving calls that use a key) and add the allow rule for `keychain-env`.
 - **Terminals under 144 columns.** Claude Code won't place a pane the user didn't open, so the box draws in the band above the prompt instead, and you press Ctrl+X then Tab to type in it. Wider, or with fullscreen rendering, it docks beside the transcript.
 - **The masking is the mod's.** A paste can show for one frame before it is redrawn as dots. Editing in the middle of the field with the arrow keys isn't tracked.
 - **No restore when publishing.** A command that runs `git commit` or `gh issue`, `gh pr` (and the like) gets no real values, so a commit message keeps the placeholder. A step that needs the key has to be its own command.
@@ -233,7 +239,7 @@ claude plugin test .
 node --experimental-strip-types tests/detect.test.mts
 ```
 
-`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms. `tests/keychain-v2.test.ts` covers pointers, `keychain-env`'s pre-load, the commit guard, `list_key_names`, `migrate_env_to_keychain` and the once-per-session note. `tests/own-approval.test.ts` covers each branch of the permission check for calls the mod filled, and that such a call is never allowed without a rule or a person. The keychain tests use `tests/fake-mac.ts`, a fake `security` that prints what the real one does. `bin/keychain-env` is checked against the real Keychain. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
+`tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms. `tests/keychain-v2.test.ts` covers pointers, `keychain-env`'s pre-load, the commit guard, `list_key_names`, `migrate_env_to_keychain` and the once-per-session note. `tests/own-approval.test.ts` covers each branch of the permission check for calls the mod filled, under both `ownPrompt` settings and in each permission mode. `tests/keychain-v3.test.ts` covers placeholders from before a reload, errored answers, the one-line answers of secret-box's tools and the rows drawn for its refusals. The keychain tests use `tests/fake-mac.ts`, a fake `security` that prints what the real one does. `bin/keychain-env` is checked against the real Keychain. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
 
 Tested with Claude Code 2.1.296.
 

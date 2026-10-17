@@ -173,9 +173,9 @@ async function restoredValue($: any, opts: Opts, input: Record<string, unknown>)
 test('use_secret: a .env variable whose value is a pointer names the item, ahead of a service of the same name', async ($, on) => {
   const opts: Opts = { items: items(), files: { '.env': 'OPENAI_API_KEY=keychain:openai?account=work\n' }, seen: [], argvs: [] }
   mac(on, opts)
-  const r = String((await call($, { tool: USE, service: 'OPENAI_API_KEY' })).result)
-  expect(r).toContain('through the OPENAI_API_KEY pointer in .env')
-  expect(r).toContain('/bin/keychain-env -- COMMAND')
+  const answer = await call($, { tool: USE, service: 'OPENAI_API_KEY' })
+  expect(String(answer.result)).toContain('through the OPENAI_API_KEY pointer in .env')
+  expect((answer.context ?? []).join('\n')).toContain('/bin/keychain-env -- COMMAND')
   expect(securityCalls(opts.argvs!).at(-1)).toEqual([SECURITY, 'find-generic-password', '-s', 'openai', '-a', 'work', '-g'])
   expect(await restoredValue($, opts, { service: 'OPENAI_API_KEY' })).toBe(hex(2))
 })
@@ -351,9 +351,9 @@ test('list_key_names: pointers, tagged items and listPrefixes items, by name onl
 
 test('list_key_names: without listPrefixes only tagged items show, with how to tag others', async ($, on) => {
   mac(on, { items: keychain().slice(1) })
-  const r = String((await call($, { tool: LIST })).result)
-  expect(r).not.toContain('acme-deploy')
-  expect(r).toContain('-j secret-box -w')
+  const answer = await call($, { tool: LIST })
+  expect(String(answer.result)).not.toContain('acme-deploy')
+  expect((answer.context ?? []).join('\n')).toContain('-j secret-box -w')
 })
 
 test('list_key_names: a listing cut off or refused says so', async ($, on) => {

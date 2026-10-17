@@ -73,8 +73,14 @@
     "ownApproval": {
       "type": "boolean",
       "title": "Approve calls with real values itself",
-      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders: your permission rules first, then secret-box's own Allow/Deny prompt. It never allows a call on its own. Off, Claude Code asks about the call with the real values in it, as before",
+      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders, so no dialog or classifier sees a key: your permission rules first, then (see ownPrompt) an allow or secret-box's own prompt. In plan and dontAsk modes Claude Code's own answer stands. Off, Claude Code asks about the call with the real values in it, as before",
       "default": true
+    },
+    "ownPrompt": {
+      "type": "boolean",
+      "title": "Ask before each call that uses a key",
+      "description": "With ownApproval on: when your permission rules don't decide a call that uses a key, show secret-box's own Allow/Deny prompt (placeholders only). Off, such a call is allowed without asking, and auto mode's classifier skips the whole command, not only the key",
+      "default": false
     },
     "notify": {
       "type": "boolean",

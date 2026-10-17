@@ -78,7 +78,9 @@ for (const [name, VALUE] of [VALUES[0]!, VALUES[4]!]) {
   test(`use_secret gives a value with ${name} a placeholder, restored exactly`, async ($, on) => {
     const seen: Record<string, unknown>[] = []
     mac(on, { items: [{ s: 'svc', value: VALUE }], seen })
-    expect(String((await call($, { tool: USE, service: 'svc' })).result)).toContain('Never write the value into a file')
+    const r = await call($, { tool: USE, service: 'svc' })
+    expect(String(r.result)).toMatch(TAG)
+    expect((r.context ?? []).join('\n')).toContain('Never write the value into a file')
     expect(await restored($, seen, { service: 'svc' })).toBe(VALUE)
   })
 }
@@ -97,16 +99,20 @@ const SHELLY: [string, string][] = [
 for (const [name, VALUE] of SHELLY) {
   test(`use_secret gives a value with ${name} no placeholder, only the command that reads it`, async ($, on) => {
     mac(on, { items: [{ s: "Bob's site", a: 'bob x', value: VALUE }] })
-    const r = String((await call($, { tool: USE, service: "Bob's site", account: 'bob x' })).result)
+    const answer = await call($, { tool: USE, service: "Bob's site", account: 'bob x' })
+    const r = String(answer.result)
+    const guide = (answer.context ?? []).join('\n')
     const command = `"$(${SECURITY} find-generic-password -s 'Bob'\\''s site' -a 'bob x' -w)"`
     const inString = `-H "Authorization: Bearer ${command.slice(1, -1)}"`
-    expect(r).not.toMatch(TAG)
-    expect(r).not.toContain(VALUE)
+    expect(r + guide).not.toMatch(TAG)
+    expect(JSON.stringify(answer)).not.toContain(VALUE)
+    // The row the user sees holds the form to write; the context, how to place it
+    expect(r).toBe(`Loaded Bob's site (account bob x) from the Keychain. Use it in Bash as ${command}.`)
     // Both ways to place it: quoted as a whole argument, bare inside a quoted string
-    expect(r).toContain(`As a whole argument of its own, write exactly: ${command}.`)
-    expect(r).toContain(`Inside a string that is already in double quotes, write it without the outer quotes`)
-    expect(r).toContain(inString)
-    expect(r).toContain('Never write the value into a file')
+    expect(guide).toContain(`As a whole argument of its own, write exactly: ${command}.`)
+    expect(guide).toContain(`Inside a string that is already in double quotes, write it without the outer quotes`)
+    expect(guide).toContain(inString)
+    expect(guide).toContain('Never write the value into a file')
     // Each is a read the pre-load pins to this very item
     const read = [{ kind: 'generic', criteria: [['-s', "Bob's site"], ['-a', 'bob x']], keychains: [] }]
     expect(keychainReads(`printf '%s' ${command} | tee out.txt`, ENV)).toEqual(read)
@@ -134,11 +140,14 @@ test('the command use_secret gives runs with the value out of the command and ou
 for (const [name, VALUE] of [VALUES[1]!, VALUES[2]!, VALUES[3]!, ['short lines', 'abcd\nefgh'], ['a non-ASCII letter and a space', 'café x-' + hex(31)]] as [string, string][]) {
   test(`use_secret won't hand out a value with ${name} for Bash, and still hides it exactly`, async ($, on) => {
     mac(on, { items: [{ s: 'svc', value: VALUE }], output: VALUE })
-    const r = String((await call($, { tool: USE, service: 'svc' })).result)
-    expect(r).not.toMatch(TAG)
-    expect(r).not.toContain('$(')
-    expect(r).toContain('Never write the value into a file')
-    expect(r).toContain('base64')
+    const answer = await call($, { tool: USE, service: 'svc' })
+    const r = String(answer.result)
+    const guide = (answer.context ?? []).join('\n')
+    expect(r).toBe("Loaded svc from the Keychain, but its value can't go into a Bash command.")
+    expect(guide).not.toMatch(TAG)
+    expect(guide).not.toContain('$(')
+    expect(guide).toContain('Never write the value into a file')
+    expect(guide).toContain('base64')
     // Decoded exactly: printed whole, the value comes back hidden
     expect(String((await call($, { tool: 'Bash', command: 'cat x' })).result)).not.toContain(VALUE)
   })
@@ -559,7 +568,19 @@ test('on macOS the box saves to the Keychain by default, and leaves .env alone',
   expect(writes).toEqual([])
   expect(JSON.stringify(r)).not.toContain(VALUE)
   expect(String(r.result)).toMatch(TAG)
-  expect(String(r.result)).toContain('call use_secret with service STRIPE_SECRET_KEY and account tester')
+  expect((r.context ?? []).join('\n')).toContain('call use_secret with service STRIPE_SECRET_KEY and account tester')
+})
+
+test("the box's row is one line with the placeholder; the context, scanned like any answer, keeps the pointer line readable", async ($, on) => {
+  const VALUE = hex(38)
+  const r = await fillBox($, on, VALUE, {})
+  const tag = String(r.result).match(TAG)![0]
+  expect(r.result).toBe(`The user entered STRIPE_SECRET_KEY, saved to the macOS Keychain (account tester) as ${tag}.`)
+  const guide = (r.context ?? []).join('\n')
+  expect(guide).toContain(`write ${tag} in a Bash command`)
+  // The detector takes a pointer for a password; it is put back as written
+  expect(guide).toContain('write the line ENV_NAME=keychain:STRIPE_SECRET_KEY?account=tester there')
+  expect(JSON.stringify(r)).not.toContain(VALUE)
 })
 
 test('the box saves under the keychainAccount setting', { options: { keychainAccount: 'work' } }, async ($, on) => {
@@ -604,11 +625,12 @@ test("when uname can't answer, backend dotenv set by hand is still the upstream 
 
 test('a value with a space typed into the box gets the read-it command, not a placeholder', async ($, on) => {
   const VALUE = 'pass word ' + hex(37)
-  const r = String((await fillBox($, on, VALUE, {})).result)
+  const answer = await fillBox($, on, VALUE, {})
+  const r = String(answer.result)
   expect(r).not.toMatch(TAG)
-  expect(r).not.toContain(VALUE)
+  expect(JSON.stringify(answer)).not.toContain(VALUE)
   expect(r).toContain(`"$(${SECURITY} find-generic-password -s STRIPE_SECRET_KEY -a tester -w)"`)
-  expect(r).toContain('Never write the value into a file')
+  expect((answer.context ?? []).join('\n')).toContain('Never write the value into a file')
 })
 
 test('backend keychain off macOS is refused before the box opens', { options: { backend: 'keychain' } }, async ($, on) => {
