@@ -1,7 +1,7 @@
 {
   "name": "secret-box",
-  "version": "0.5.0",
-  "description": "Claude can use a secret without seeing it: a masked box saves keys to .env and gives Claude a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
+  "version": "0.5.0-keychain.1",
+  "description": "Claude can use a secret without seeing it: a masked box saves keys to the macOS Keychain (or .env) and gives Claude a placeholder, use_secret loads a Keychain item as a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
   "author": {
     "name": "Ray Amjad",
     "url": "https://github.com/ray-amjad"
@@ -9,6 +9,31 @@
   "repository": "https://github.com/ray-amjad/claude-code-mods/tree/main/plugins/secret-box",
   "license": "MIT",
   "userConfig": {
+    "backend": {
+      "type": "string",
+      "title": "Where the box saves",
+      "description": "auto: the macOS Keychain on a Mac, the project .env elsewhere. keychain saves to the Keychain (service = the name, nothing written to .env; macOS only); dotenv writes the project .env as before",
+      "options": ["auto", "keychain", "dotenv"],
+      "default": "auto"
+    },
+    "refuseUnmaskable": {
+      "type": "boolean",
+      "title": "Refuse Keychain reads it can't hide",
+      "description": "macOS: refuse a Bash command that reads the Keychain in a way secret-box can't pin to one item or hide (a variable, sudo, dump-keychain, security -i, a value under 8 characters). Off, the command runs and only the detector scans its output",
+      "default": false
+    },
+    "listPrefixes": {
+      "type": "string",
+      "title": "Keychain services list_key_names may show",
+      "description": "macOS: service-name prefixes, separated by commas (myapp/,openai). list_key_names shows the names of Keychain items whose service starts with one, beside the items secret-box saved. Empty: only those",
+      "default": ""
+    },
+    "keychainAccount": {
+      "type": "string",
+      "title": "Keychain account",
+      "description": "The account the box saves Keychain items under. Empty means your macOS user name",
+      "default": ""
+    },
     "secrets": {
       "type": "boolean",
       "title": "Hide secrets",
@@ -44,6 +69,18 @@
       "title": "Tools that get real values",
       "description": "Tools that run on this machine and may receive the real value behind a placeholder, separated by commas. Never list a tool that sends its input to another model or the network (Agent, WebFetch, WebSearch)",
       "default": "Bash,Write,Edit,MultiEdit,NotebookEdit"
+    },
+    "ownApproval": {
+      "type": "boolean",
+      "title": "Approve calls with real values itself",
+      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders, so no dialog or classifier sees a key: your permission rules first, then (see ownPrompt) an allow or secret-box's own prompt. In plan mode such a call is refused until the plan ends; in dontAsk mode Claude Code's own answer stands. Off, Claude Code asks about the call with the real values in it, as before",
+      "default": true
+    },
+    "ownPrompt": {
+      "type": "boolean",
+      "title": "Ask before each call that uses a key",
+      "description": "With ownApproval on: when your permission rules don't decide a call that uses a key, show secret-box's own Allow/Deny prompt (placeholders only). Off, such a call is allowed without asking, and auto mode's classifier skips the whole command, not only the key",
+      "default": false
     },
     "notify": {
       "type": "boolean",

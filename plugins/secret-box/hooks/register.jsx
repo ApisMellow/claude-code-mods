@@ -3,21 +3,38 @@
 // Pattern: guard what you can't undo. A secret in the conversation is in the
 // transcript for good, so it must never get there:
 //   - In: Claude calls request_secret, you paste the value into a masked box,
-//     the mod writes it to .env and hands Claude a placeholder.
+//     the mod saves it to the macOS Keychain (or .env) and hands Claude a
+//     placeholder. use_secret loads a Keychain item as a placeholder too.
 //   - Out: every secret a tool would show Claude (a `cat .env`, an API answer,
 //     a key you paste) is swapped for a placeholder like [REDACTED-SECRET-1a2b3c4d].
 //   - Use: a placeholder in a tool's input becomes the real value as the tool
 //     runs, so `curl -H "Authorization: Bearer [REDACTED-SECRET-...]"` works.
 //   - Never: committing .env is refused, since a pushed key can't be taken back.
 //
-// The redaction is transcript-redactor, unchanged (./redact.ts, ./detect.ts):
-// its hooks do the In, Out and Use. This file adds the box, teaches the vault
-// the values in .env, and guards commits. Nothing is written but .env.
+// The redaction is transcript-redactor (./redact.ts, ./detect.ts): its hooks
+// do the In, Out and Use. redact.ts adds one thing: a call it filled with real
+// values gets its permission check answered on the call as Claude wrote it
+// (ownApproval), so the key never reaches the dialog or the auto-mode
+// classifier. This file adds the box, use_secret,
+// list_key_names and migrate_env_to_keychain, keeps .env pointers readable,
+// teaches the vault the values in .env and the Keychain items a command (or
+// bin/keychain-env) reads, and guards commits. Nothing is written but Keychain
+// items and .env.
 
-import { register as redactor, LIVE_TAG_TOOLS, brand } from './redact.ts'
-import { keepSecret } from './detect.ts'
+import { register as redactor, LIVE_TAG_TOOLS, brand, errorText, tagNames } from './redact.ts'
+import { collect, keepSecret, makeConfig, restore, scrubSecrets, walk } from './detect.ts'
+import {
+  addHint, badName, BOX_COMMENT, boxBackend, defaultAccount, envAssignments, envPointers, envValue, keychainItems, keychainReads,
+  itemExists, looksLikeKey, MIN_HIDDEN, NOT_FOUND, parsePointer, platformOf, pointerTo, quoteCloses, readCommand, readKeychain, saveToKeychain,
+  serviceRead, SHELL_ACTIVE,
+} from './keychain.js'
 
 const TOOL = 'mcp__secret-box__request_secret'
+const USE = 'mcp__secret-box__use_secret'
+const LIST = 'mcp__secret-box__list_key_names'
+const MIGRATE = 'mcp__secret-box__migrate_env_to_keychain'
+// list_key_names says this first, word for word, and so do the README and the skill
+const NAMES_ONLY = "Returns key names only and never fetches or returns any key's value."
 const PANE = 'secret-box'
 const DOT = '•'
 
@@ -29,39 +46,518 @@ let pending = null // { name, reason, value, answer, isInBand }
 const SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|CREDENTIAL|AUTH|PRIVATE|DSN|SALT|SIGNING|WEBHOOK/i
 const ASSIGNMENT = /^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)(.*)$/gm
 
+// A Keychain read in a Bash command whose output the pre-load can't promise to
+// hide: it can't be parsed, it names something only the shell knows, the fetch
+// failed, the value is too short to hide, or it dumps the keychain. Every such
+// case comes here, and `refuse` is the one switch: the refuseUnmaskable
+// option, off by default. Off, the command runs and only the detector scans
+// what it prints. On, the command is refused.
+export function unmaskable(why, refuse) {
+  return refuse
+    ? { deny: `secret-box: this command reads the Keychain, but ${why}, so what it prints can't be hidden. Use use_secret instead.` }
+    : undefined
+}
+
+// 'mac', 'other' or 'unknown', asked once per load (`memo` is that load's)
+function platformIn($, memo) {
+  return (memo.platform ??= platformOf($))
+}
+
+// How Claude is to use a Keychain value it now has a placeholder for, by what
+// the value holds, in two parts. `loaded(head)` ends the one line the user
+// sees in the tool's row: what to write in a command (the placeholder, or a
+// read of the item inside the command), so the model has it even if the
+// context is lost. `guide` is the rest, for the model alone (the answer's
+// context). The redactor won't put a value with a space, a quote or another
+// shell character into a Bash command. So such a value gets no placeholder:
+// Claude reads it from the Keychain inside the command, or not at all.
+function howToUse(service, account, value, tag) {
+  const never = "Never write the value into a file: Claude Code keeps a plain copy of every file it edits under ~/.claude/file-history."
+  const short = value.length < MIN_HIDDEN ? ` It is under ${MIN_HIDDEN} characters, so if a command prints it, it can't be hidden: don't print it.` : ''
+  if (!SHELL_ACTIVE.test(value)) {
+    return {
+      loaded: (head) => `${head} as ${tag}.`,
+      guide: `You can't see the value. To use it, write ${tag} in a Bash command: it becomes the real value when the command runs and is hidden again in the output.${short} ${never}`,
+    }
+  }
+  if (/^[\x20-\x7e]*$/.test(value)) {
+    // Pasted with its own quotes into a string already in double quotes, the
+    // quotes would cancel and the shell would split the value into fragments
+    const quoted = readCommand(service, account)
+    const bare = quoted.slice(1, -1)
+    return {
+      loaded: (head) => `${head}. Use it in Bash as ${quoted}.`,
+      guide: `You can't see the value. It holds a space or a shell character, so it can't go into a command as a placeholder. Instead, have the shell read it from the Keychain where the value goes. As a whole argument of its own, write exactly: ${quoted}. Inside a string that is already in double quotes, write it without the outer quotes, so it stays one word inside that string: -H "Authorization: Bearer ${bare}". The value never appears in the command, and anything the command prints of it comes back hidden.${short} ${never}`,
+    }
+  }
+  return {
+    loaded: (head) => `${head}, but its value can't go into a Bash command.`,
+    guide: `You can't see the value. It holds characters that can't safely go into a Bash command (a newline, say), so it can't be used here. ${never} Ask the user to store it base64-encoded instead, as the secret-box README describes.`,
+  }
+}
+
+// bin/keychain-env, by the absolute path Claude can run it from
+function runnerPath($) {
+  return `${$.plugin.root}/bin/keychain-env`
+}
+
+// Every value this file hands the vault. The vault can't be asked what it
+// holds, and values under 8 characters aren't indexed for the scrubber to
+// find, so isCleanPointer checks against this set too. `name` says what the
+// value is (a Keychain item, a .env variable) in the approval prompt.
+const keptValues = new Set()
+function keep(value, name) {
+  keptValues.add(value)
+  const tag = keepSecret(value)
+  if (name) tagNames.set(tag, name)
+  return tag
+}
+
+// How the approval prompt names a Keychain item
+function itemName(service, account) {
+  return `the Keychain item ${service}${account ? ` (account ${account})` : ''}`
+}
+
+// A pointer that is only a pointer: its service and account each pass the
+// detector on their own, aren't shaped like a key (hex, a UUID, a long mixed
+// token, which the detector leaves alone), and hold no placeholder and no
+// value this mod hid. The text a hidden span stands for has any key inside it
+// put back, so a real key written after `keychain:` reads back as
+// `keychain:<key>`. It stays hidden.
+function isCleanPointer(value, cfg) {
+  const pointer = parsePointer(value)
+  if (!pointer) return false
+  return [pointer.service, pointer.account ?? ''].every(
+    (s) =>
+      !s.includes('[REDACTED-') &&
+      !looksLikeKey(s) &&
+      ![...keptValues].some((v) => v.length >= 4 && s.includes(v)) &&
+      collect(() => scrubSecrets(s, cfg)).tags.size === 0,
+  )
+}
+
+// The detector takes the value of `OPENAI_API_KEY=keychain:openai` for a
+// password and hides it. A pointer only names a Keychain item, so a
+// placeholder that stands for a clean one is put back as the pointer text.
+const SECRET_TAG = /\[REDACTED-SECRET-[0-9a-f]{8}\]/g
+function showPointers(r, cfg) {
+  let changed = false
+  const show = (text) =>
+    typeof text !== 'string' || !text.includes('[REDACTED-SECRET-')
+      ? text
+      : text.replace(SECRET_TAG, (tag) => {
+          const value = restore(tag)
+          if (value === tag || !isCleanPointer(value, cfg)) return tag
+          changed = true
+          return value
+        })
+  if (r.deny !== undefined) {
+    const deny = show(r.deny)
+    return changed ? { deny } : r
+  }
+  const st = { incomplete: false }
+  const result = walk(r.result, show, st)
+  const text = show(r.text)
+  const context = r.context?.map(show)
+  if (!changed || st.incomplete) return r
+  // An errored answer can't be rewritten in place (see the redactor's
+  // tool.call): it goes back as a refusal holding the new text
+  if (r.isError) return { deny: errorText(text, result) }
+  return { result, ...(context ? { context } : {}) }
+}
+
+// A .env file with a key written in it in plaintext
+const holdsPlaintext = (text) => envAssignments(text).some(([name, value]) => SECRET_NAME.test(name) && value !== '' && !parsePointer(value))
+
+// The one note per session, at the first sign of keys in play, that tells the
+// model secret-box is here and how .env pointers work
+async function nudgeText($) {
+  let plaintext = []
+  try {
+    plaintext = (await projectEnvFiles($)).filter((f) => holdsPlaintext(f.text)).map((f) => f.name)
+  } catch {}
+  return (
+    'secret-box is installed: keys live in the macOS Keychain, never in a file or the chat. In a .env file, write a pointer ' +
+    'instead of a value, NAME=keychain:SERVICE or NAME=keychain:SERVICE?account=ACCOUNT, and run the app with ' +
+    `${runnerPath($)} -- COMMAND. Load the secret-box:secrets skill before working with any key or .env file.` +
+    (plaintext.length ? ` ${plaintext.join(', ')} hold${plaintext.length === 1 ? 's' : ''} plaintext keys: offer to move them with migrate_env_to_keychain.` : '')
+  )
+}
+
+// The project's .env files (not .env.example and the like) in the shell's
+// folder, with their text
+async function projectEnvFiles($) {
+  const cwd = await $.session.cwd()
+  const files = []
+  for (const entry of await $.fs.list(cwd)) {
+    if (entry.kind !== 'file' || !isEnvFile(entry.name)) continue
+    try {
+      files.push({ name: entry.name, path: `${cwd}/${entry.name}`, text: await $.fs.read(`${cwd}/${entry.name}`) })
+    } catch {}
+  }
+  return files.sort((a, b) => (a.name < b.name ? -1 : 1))
+}
+
+// Why a .env file may not be committed, or '' when it may: it holds pointers,
+// each a clean one to an item the Keychain holds, every secret-named value is
+// a pointer (or empty), every quote closes on its line, and the detector finds
+// no key in the rest. Whether the Keychain holds an item is asked once per
+// load (`memo.items` keeps only items found, so one added later is seen); an
+// answer that can't be had refuses, since this is a guard.
+async function keyIn($, text, cfg, memo) {
+  let pointers = 0
+  const rest = []
+  for (const line of String(text).split('\n')) {
+    const [assignment] = envAssignments(line)
+    if (assignment) {
+      const [name, value, raw] = assignment
+      // A quoted value that runs on below its line (a PEM key) can't be judged line by line
+      if (!quoteCloses(raw)) return `${name} has a quoted value that runs past its line`
+      if (isCleanPointer(value, cfg)) {
+        const pointer = parsePointer(value)
+        const key = JSON.stringify([pointer.service, pointer.account ?? ''])
+        if (!memo.items.has(key)) {
+          const exists = await itemExists($, pointer)
+          if (exists === false) return `${name} points to ${value}, which the Keychain doesn't hold`
+          if (exists !== true) return `whether the Keychain holds ${name}'s item (${value}) could not be checked`
+          memo.items.add(key)
+        }
+        pointers++
+        continue
+      }
+      if (value !== '' && SECRET_NAME.test(name)) return `${name} holds a key`
+    }
+    rest.push(line)
+  }
+  if (pointers === 0) return 'it holds no keychain: pointer'
+  return collect(() => scrubSecrets(rest.join('\n'), cfg)).tags.size === 0 ? '' : 'it holds a key'
+}
+
+// Before bin/keychain-env runs: load every pointer it will resolve, from the
+// .env files it will read. '' when all are loaded, else why not.
+async function preloadRunner($, envFiles) {
+  const cwd = await $.session.cwd()
+  for (const file of envFiles) {
+    const path = isAbsolute(file) ? file : `${cwd}/${file}`
+    // A missing file: the runner resolves nothing from it (and stops if it was named)
+    if (!(await $.fs.exists(path))) continue
+    let text
+    try {
+      text = await $.fs.read(path)
+    } catch {
+      return `keychain-env reads ${file}, which secret-box can't read`
+    }
+    for (const [, pointer] of envPointers(text)) {
+      const got = await readKeychain($, serviceRead(pointer.service, pointer.account))
+      for (const shown of got.printed || []) keep(shown, itemName(pointer.service, pointer.account))
+      if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) return `security could not read ${pointer.service} (exit ${got.exitCode})`
+      if ((got.printed || []).some((p) => p.length < MIN_HIDDEN)) return `the value of ${pointer.service} is too short to be hidden`
+    }
+  }
+  return ''
+}
+
+// list_key_names: the pointers in the project's .env files, and the Keychain
+// items the box tagged or whose service starts with a listPrefixes entry.
+// Names only: no value is ever fetched. The names are the answer the user
+// sees; how to use them is the model's alone (its context).
+async function listKeyNames($, options) {
+  const clean = (s) => String(s).replace(/[\x00-\x1f\x7f]/g, '?')
+  const pointers = []
+  try {
+    for (const f of await projectEnvFiles($)) {
+      for (const [name, p] of envPointers(f.text)) pointers.push(`  ${name} in ${f.name}: service ${clean(p.service)}${p.account ? `, account ${clean(p.account)}` : ''}`)
+    }
+  } catch {}
+  const prefixes = String((options || {}).listPrefixes || '').split(',').map((p) => p.trim()).filter(Boolean)
+  const items = []
+  let note = ''
+  try {
+    const listed = await keychainItems($)
+    for (const i of listed.items) {
+      if (i.comment !== BOX_COMMENT && !prefixes.some((p) => i.service.startsWith(p))) continue
+      const line = `  service ${clean(i.service)}${i.account ? `, account ${clean(i.account)}` : ''}${i.label && i.label !== i.service ? `, label ${clean(i.label)}` : ''}`
+      if (!items.includes(line)) items.push(line)
+    }
+    if (listed.isCut) note = 'The keychain listing was cut off, so some names may be missing.'
+  } catch (err) {
+    note = `The Keychain could not be listed (${String((err && err.message) || err).slice(0, 100)}).`
+  }
+  const result = [
+    NAMES_ONLY,
+    "Pointers in this project's .env files:",
+    ...(pointers.length ? pointers : ['  none']),
+    'Keychain items secret-box saved, or whose service starts with a listPrefixes entry:',
+    ...(items.length ? items : ['  none']),
+    ...(note ? [note] : []),
+  ].join('\n')
+  const context = [
+    `To load a pointer's key, give its variable name to use_secret, or run the app with ${runnerPath($)} -- COMMAND to set every pointer. ` +
+      "To load a listed Keychain item, give use_secret its service, and its account when several items share the service. " +
+      'An item shows in this list once it is tagged (security add-generic-password -U -s SERVICE -a ACCOUNT -j secret-box -w) or its service starts with a listPrefixes entry.',
+  ]
+  return { result, context }
+}
+
+// migrate_env_to_keychain. Per entry: save to the Keychain, read it back and
+// compare, and only then rewrite that line as a pointer. The file is written
+// with $.fs, not the Write tool, so no copy of the old text lands in
+// ~/.claude/file-history, and no backup is made. A tool the mod answers gets
+// no approval dialog from Claude Code, so the mod asks the user itself unless
+// a permission rule already allows or denies the call.
+async function migrateEnv($, e, options) {
+  const file = String(e.file || '.env')
+  if (!isEnvFile(file)) return `${file} is not a .env file. Nothing was changed.`
+  const path = isAbsolute(file) ? file : `${await $.session.cwd()}/${file}`
+  let text
+  try {
+    text = await $.fs.read(path)
+  } catch {
+    return `${file} could not be read. Nothing was changed.`
+  }
+  const wanted = Array.isArray(e.names) && e.names.length ? e.names.map(String) : undefined
+  const lines = text.split('\n')
+  const plan = []
+  const leftAsIs = []
+  for (const [i, line] of lines.entries()) {
+    const eol = line.endsWith('\r') ? '\r' : ''
+    const m = /^([ \t\r\v\f]*(?:export[ \t\r\v\f]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t\r\v\f]*=)[ \t\r\v\f]*([^\n]*)$/.exec(eol ? line.slice(0, -1) : line)
+    if (!m) continue
+    const value = envValue(m[3])
+    if (value === '' || parsePointer(value) || !(wanted ? wanted.includes(m[2]) : SECRET_NAME.test(m[2]))) continue
+    // A quote that closes below its line (a PEM key) or a backslash escape
+    // (`"a\nb"`): this line alone is not the value, so it stays as it is
+    if (!quoteCloses(m[3]) || value.includes('\\')) {
+      leftAsIs.push(`${m[2]} (its value spans lines or holds backslash escapes: store it base64-encoded, as the secret-box skill's multi-line-values.md describes)`)
+      continue
+    }
+    plan.push({ i, name: m[2], value, head: m[1], eol })
+  }
+  const missing = (wanted || []).filter((n) => !plan.some((p) => p.name === n) && !leftAsIs.some((k) => k.startsWith(`${n} `)))
+  const notFound = missing.length ? ` Not found with a plaintext value: ${missing.join(', ')}.` : ''
+  if (plan.length === 0) {
+    const why = leftAsIs.length ? `Left as they were: ${leftAsIs.join('; ')}.` : `${file} has no ${wanted ? 'such entries' : 'secret-named entries'} with a plaintext value.`
+    return `${why} Nothing was changed.${notFound}`
+  }
+  const names = plan.map((p) => p.name).join(', ')
+
+  let decision = 'ask'
+  try {
+    ;({ decision } = await $.tool.check({ tool: MIGRATE, input: { file: e.file, names: e.names } }))
+  } catch {}
+  if (decision === 'deny') return 'A permission rule denies migrate_env_to_keychain. Nothing was changed.'
+  if (decision !== 'allow') {
+    const answer = await $.ui.ask(`Move ${names} from ${file} into the macOS Keychain? Each line becomes a keychain: pointer once the Keychain holds its value.`, ['Move them', 'Cancel']).catch(() => '')
+    if (answer !== 'Move them') return `The user did not approve moving ${names}. Nothing was changed.`
+  }
+
+  const account = await defaultAccount($, options)
+  if (!account || badName('account', account)) return 'No Keychain account: set the keychainAccount option. Nothing was changed.'
+  // PROJECTDIR/ENV_NAME, the folder that holds the .env file
+  const folder = path.split('/').slice(-2, -1)[0] || 'project'
+  const moved = []
+  for (const p of plan) {
+    const service = `${folder}/${p.name}`
+    const pointer = pointerTo(service, account)
+    if (!pointer) {
+      leftAsIs.push(`${p.name} (the folder or account name holds a character a pointer can't carry)`)
+      continue
+    }
+    try {
+      const before = await readKeychain($, serviceRead(service, account))
+      if (before.exitCode === undefined && before.value !== p.value) {
+        leftAsIs.push(`${p.name} (the Keychain already holds a different value for ${service})`)
+        continue
+      }
+      if (before.exitCode !== undefined && before.exitCode !== NOT_FOUND) {
+        leftAsIs.push(`${p.name} (security exited ${before.exitCode})`)
+        continue
+      }
+      if (before.exitCode === NOT_FOUND) await saveToKeychain($, service, account, p.value)
+      const after = await readKeychain($, serviceRead(service, account))
+      if (after.exitCode !== undefined || after.value !== p.value) {
+        leftAsIs.push(`${p.name} (the Keychain did not read back the same value)`)
+        continue
+      }
+      for (const shown of after.printed) keep(shown, itemName(service, account))
+      lines[p.i] = `${p.head}${pointer}${p.eol}`
+      moved.push(`  ${p.name}=${pointer}`)
+    } catch (err) {
+      leftAsIs.push(`${p.name} (${String((err && err.message) || err).slice(0, 100)})`)
+    }
+  }
+  if (moved.length) {
+    try {
+      await $.fs.write(path, lines.join('\n'))
+    } catch {
+      return `The Keychain now holds the values of ${moved.length} entries, but ${file} could not be rewritten, so it is unchanged. Nothing else was changed.`
+    }
+  }
+  // The report is the answer the user sees; how to run the app is the model's
+  const result = [
+    moved.length ? `Moved into the Keychain (account ${account}); these lines of ${file} are now pointers:` : `Nothing in ${file} was changed.`,
+    ...moved,
+    ...(leftAsIs.length ? [`Left as they were: ${leftAsIs.join('; ')}.`] : []),
+  ].join('\n') + notFound
+  return moved.length ? { result, context: [`Run the app with ${runnerPath($)} -- COMMAND so the pointers are set from the Keychain.`] } : { result }
+}
+
 export function register(on, options) {
-  // request_secret answers with a live placeholder: keep it live
+  // request_secret and use_secret answer with a live placeholder: keep it live
   LIVE_TAG_TOOLS.add(TOOL)
+  LIVE_TAG_TOOLS.add(USE)
   brand.name = 'secret-box'
+  // use_secret, list_key_names, migrate_env_to_keychain and the pre-load are on
+  // unless this is known not to be a Mac, and the box saves to the Keychain
+  // only on one (unless backend says otherwise)
+  const memo = { items: new Set() }
+  const refuse = [true, 'true'].includes((options || {}).refuseUnmaskable)
+  // The detector's settings, for the commit guard's own scan of a .env file
+  const cfg = makeConfig(options || {})
+  // The nudge is said once per session: at the first prompt when the session
+  // starts beside .env files, else at the first tool call that touches one or
+  // has a key hidden from its result
+  const once = { isNudged: false, isEnvAtStart: false }
+
+  // 0. Outside the redactor, so these see what it made of each call: pointers
+  //    it hid are put back, and the nudge rides along when its moment comes.
+  //    (A match-all matcher: the redactor holds the bare registration.)
+  on('tool.call', { tool: /^/ }, async ($, e, next) => {
+    // `keychain:[REDACTED-SECRET-…]` would be restored into the key itself,
+    // written where a service name belongs
+    if (cfg.restore && cfg.restoreTools.has(e.tool) && /keychain:\[REDACTED-SECRET-[0-9a-f]{8}\]/.test(JSON.stringify(e))) {
+      return {
+        deny:
+          'secret-box: a .env pointer names a Keychain item: after keychain: write its service name (keychain:openai, ' +
+          'keychain:myapp/STRIPE_SECRET_KEY), never a placeholder, which would put the key itself in its place.',
+      }
+    }
+    const r = showPointers(await next(e), cfg)
+    if (once.isNudged || r.deny !== undefined || (await platformIn($, memo)) === 'other') return r
+    const input = JSON.stringify(e)
+    const hidKey = !LIVE_TAG_TOOLS.has(e.tool) && (JSON.stringify([r.result, r.text]).match(SECRET_TAG) || []).some((t) => !input.includes(t))
+    if (!hidKey && envFiles(e).length === 0) return r
+    once.isNudged = true
+    // The answer as it came, context added: core's own answer (an errored
+    // one too) keeps the handle on its messages, so its result isn't checked
+    // against the tool's output shape again
+    return { ...r, context: [...(r.context ?? []), await nudgeText($)] }
+  }).catch(($, e, next) => next(e))
+  on('prompt.attachment', { type: /^/ }, async ($, e, next) => {
+    const r = await next(e)
+    if (typeof r.text !== 'string') return r
+    const shown = showPointers({ result: r.text }, cfg)
+    return shown.result === r.text ? r : { text: shown.result }
+  }).catch(($, e, next) => next(e))
+
+  // What the redactor's refusals tell Claude to do: never write a key to a file
+  brand.shellHint =
+    'If it is a Keychain item, call use_secret and write exactly the form it gives, which reads the key inside the command. ' +
+    "Otherwise ask the user to save it with request_secret, then do the same. Don't write it into a file."
+  brand.staleHint = 'Call use_secret (or request_secret) for that key again and use the placeholder it gives.'
   redactor(on, options || {})
 
-  // 1. Give Claude the tool, and teach the vault the secrets already in .env
+  // 1. Give Claude the tools, and teach the vault the secrets already in .env
   on('session.start', async ($, e, next) => {
+    const platform = await platformIn($, memo)
+    const isKeychain = boxBackend((options || {}).backend, platform) !== 'dotenv'
+    if (platform === 'unknown') {
+      $.ui.toast("secret-box couldn't tell whether this is a Mac (uname didn't answer). use_secret stays on; the box won't save until the backend option is set to keychain or dotenv.")
+    }
     await $.tool.register({
       name: 'request_secret',
-      description:
-        'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
-        'The user pastes it into a masked box and the mod saves it to the project .env. You get back the ' +
-        'variable name and a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
-        'or file and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to ' +
-        'paste a secret into chat.',
+      description: isKeychain
+        ? 'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
+          'The user pastes it into a masked box and the mod saves it to the macOS Keychain under that name. ' +
+          'You get back a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
+          'and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to paste a ' +
+          'secret into chat. For a secret already in the Keychain, use use_secret.'
+        : 'Ask the user for a secret (API key, token, password) without it ever entering the conversation. ' +
+          'The user pastes it into a masked box and the mod saves it to the project .env. You get back the ' +
+          'variable name and a placeholder like [REDACTED-SECRET-1a2b3c4d]. Write that placeholder in a command ' +
+          'or file and it becomes the real value when the tool runs. Use this INSTEAD of asking the user to ' +
+          'paste a secret into chat.',
       inputSchema: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Environment variable name, e.g. STRIPE_SECRET_KEY' },
+          name: {
+            type: 'string',
+            description: isKeychain
+              ? "The Keychain service to save it under: PROJECTDIR/ENV_NAME for this project's own key (myapp/STRIPE_SECRET_KEY), a short shared name (openai) for a key used across projects"
+              : 'Environment variable name, e.g. STRIPE_SECRET_KEY',
+          },
           reason: { type: 'string', description: 'One short line telling the user why it is needed' },
         },
         required: ['name', 'reason'],
       },
       isDeferred: false,
     })
+    if (platform !== 'other') {
+      const runner = runnerPath($)
+      await $.tool.register({
+        name: 'use_secret',
+        description:
+          'Load a secret the user keeps in the macOS Keychain (a generic password) without it ever entering the ' +
+          'conversation. Give its service name, or the name of a variable whose .env value is a keychain: pointer, ' +
+          'and the account when several items share a service. You get back how to use it in a Bash command: usually ' +
+          'a placeholder like [REDACTED-SECRET-1a2b3c4d] that becomes the real value when the command runs and is ' +
+          'hidden again in the output. Use this INSTEAD of running `security find-generic-password` yourself. Never ' +
+          `write the value into a file. To run an app with every .env pointer set, use ${runner} -- COMMAND. If the ` +
+          'item is missing, you get the command the user can run to add it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            service: { type: 'string', description: 'The Keychain service (openai, myapp/STRIPE_SECRET_KEY), or a .env variable name whose value is a keychain: pointer' },
+            account: { type: 'string', description: 'The Keychain account, only when several items share the service. Given, `service` is always read as a service' },
+          },
+          required: ['service'],
+        },
+        isDeferred: false,
+      })
+      await $.tool.register({
+        name: 'list_key_names',
+        description:
+          `${NAMES_ONLY} Lists the keychain: pointers in this project's .env files, and the macOS Keychain items ` +
+          'secret-box saved or whose service starts with one of the listPrefixes setting: service, account and label. ' +
+          'Call it to find the name to give use_secret.',
+        inputSchema: { type: 'object', properties: {} },
+        isDeferred: false,
+      })
+      await $.tool.register({
+        name: 'migrate_env_to_keychain',
+        description:
+          'Move plaintext keys out of one .env file into the macOS Keychain, and rewrite each moved line as a ' +
+          'keychain: pointer. By default it moves every secret-named entry that holds a plaintext value; give names ' +
+          'to choose. Each goes to service PROJECTDIR/NAME, account $USER, tagged for list_key_names. A value is ' +
+          'written, read back and compared before its line changes; any failure leaves that line as it was. The user ' +
+          'confirms first. Never returns a value.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file: { type: 'string', description: 'The .env file, relative to the current folder (default .env)' },
+            names: { type: 'array', items: { type: 'string' }, description: 'The variables to move (default: every secret-named one with a plaintext value)' },
+          },
+        },
+      })
+    }
     await learnDotenv($, ['.env'])
+    // Beside .env files on a Mac, the nudge goes with the first prompt
+    try {
+      once.isEnvAtStart = platform !== 'other' && (await projectEnvFiles($)).length > 0
+    } catch {}
     return next(e)
   })
 
+  // The first prompt of a session that starts beside .env files carries the nudge
+  on('prompt.submit', { text: /^/ }, async ($, e, next) => {
+    if (once.isNudged || !once.isEnvAtStart || e.command || e.isMeta) return next(e)
+    once.isNudged = true
+    return next({ ...e, context: [...(e.context ?? []), await nudgeText($)] })
+  }).catch(($, e, next) => next(e))
+
   // 2. The guard: .env may be read (its secrets come back hidden), never committed
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const why = await commitBlockReason($, String(e.command || ''))
+    const why = await commitBlockReason($, String(e.command || ''), cfg, memo)
     return why ? { deny: `secret-box: ${why} A pushed key can't be taken back.` } : next(e)
   }).catch(() => ({ deny: 'secret-box: the .env guard failed, so this call is blocked to be safe.' }))
 
@@ -74,6 +570,139 @@ export function register(on, options) {
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'secret-box: could not check this .env file, so the call is blocked to be safe.' }))
 
+  // 3b. A command that reads the Keychain itself (`security find-generic-password
+  //     -s NAME -w`): load the item it reads into the vault before it runs, by
+  //     the same match options and keychain files, so what it prints (-w on
+  //     stdout, -g on stderr, as text or hex) comes back hidden. A read it
+  //     can't promise to hide goes to unmaskable(). Every command is read,
+  //     not only ones that spell find-*-password: a read can be spelled
+  //     around that (find-generic-pass\word, security -i < commands).
+  //     A hook nested under the redactor's that throws fails into the
+  //     redactor's .catch, which withholds the call, not into its own. So
+  //     failures are handled here.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const command = String(e.command || '')
+    let reads = []
+    try {
+      if (keychainReads(command).length > 0 && (await platformIn($, memo)) !== 'other') {
+        reads = keychainReads(command, { USER: await $.env.get('USER'), LOGNAME: await $.env.get('LOGNAME'), HOME: await $.env.get('HOME') })
+      }
+    } catch {
+      reads = [{ unknown: 'secret-box could not read it' }]
+    }
+    for (const read of reads) {
+      let why = read.unknown
+      if (!why && read.envFiles) {
+        // bin/keychain-env: every pointer in the .env files it will read
+        try {
+          why = await preloadRunner($, read.envFiles)
+        } catch (err) {
+          why = String((err && err.message) || err)
+        }
+      } else if (!why) {
+        try {
+          const got = await readKeychain($, read)
+          const service = (read.criteria || []).find(([flag]) => flag === '-s')
+          for (const shown of got.printed || []) keep(shown, service ? itemName(service[1]) : undefined)
+          // No such item: the command finds none either. Locked or refused: it might still print it
+          if (got.exitCode !== undefined && got.exitCode !== NOT_FOUND) why = `security could not read the item (exit ${got.exitCode})`
+          // The vault can't find a form this short where it turns up
+          else if ((got.printed || []).some((p) => p.length < MIN_HIDDEN)) why = 'its value is too short to be hidden'
+        } catch (err) {
+          why = String((err && err.message) || err)
+        }
+      }
+      const refusal = why && unmaskable(why, refuse)
+      if (refusal) return refusal
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // 3c. use_secret: load a Keychain item and answer with a placeholder, or the
+  //     way to read it inside a command, never the value. What `security`
+  //     prints is never put in the answer. Failures are answered here, for the
+  //     same reason as above.
+  on('tool.call', { tool: USE }, async ($, e, next) => {
+    if ((await platformIn($, memo)) === 'other') return { result: 'use_secret needs macOS. Nothing was loaded.' }
+    let service = String(e.service ?? '')
+    let account = String(e.account ?? '')
+    const why = (service ? badName('service', service) : 'Give the Keychain service name.') || badName('account', account)
+    if (why) return { result: `${why} Nothing was loaded.` }
+
+    try {
+      // Which item: with no account, a variable in the project's .env files
+      // whose value is a pointer names it; otherwise `service` is the service
+      let via = ''
+      let runner = ''
+      if (!account) {
+        const name = service
+        let defs = []
+        try {
+          defs = (await projectEnvFiles($)).flatMap((f) => envPointers(f.text).filter(([n]) => n === name).map(([, p]) => ({ file: f.name, ...p })))
+        } catch {}
+        const items = [...new Set(defs.map((d) => pointerTo(d.service, d.account)))]
+        const files = [...new Set(defs.map((d) => d.file))].join(', ')
+        if (items.length > 1) return { result: `${name} points to different Keychain items in ${files}: ${items.join(' and ')}. Call use_secret with the service and account you mean. Nothing was loaded.` }
+        if (defs.length) {
+          service = defs[0].service
+          account = defs[0].account ?? ''
+          via = ` through the ${name} pointer in ${files}`
+          runner = ` To run an app with every .env pointer set, use ${runnerPath($)} -- COMMAND.`
+        }
+      }
+      const { value, printed, exitCode } = await readKeychain($, serviceRead(service, account))
+      const item = `The Keychain item ${service}${account ? ` (account ${account})` : ''}`
+      if (exitCode === undefined) {
+        // Every form security prints it in is hidden, should a command print the item itself
+        for (const shown of printed) keep(shown, itemName(service, account))
+        if (value) {
+          const tag = keep(value, itemName(service, account))
+          // The ONLY things Claude learns: the service, and how to use the
+          // value without seeing it. The user's row gets the one line.
+          const use = howToUse(service, account, value, tag)
+          return { result: use.loaded(`Loaded ${service}${account ? ` (account ${account})` : ''} from the Keychain${via}`), context: [use.guide + runner] }
+        }
+        if (value === undefined) return { result: `${item} holds bytes that are not text, so it can't be used in a command. Nothing was loaded.` }
+      }
+      const hint = addHint(service, account || (await defaultAccount($, options)))
+      if (exitCode === NOT_FOUND) {
+        return { result: `No Keychain item has the service ${service}${account ? ` and account ${account}` : ''}. Ask the user to add it in a terminal with this command, which prompts for the value so the key never lands in shell history:\n${hint}\nThen call use_secret again.` }
+      }
+      if (exitCode === undefined) {
+        return { result: `${item} holds no value. Ask the user to set one in a terminal with this command, which prompts for it:\n${hint}\nThen call use_secret again.` }
+      }
+      return { result: `${item} could not be read (security exited ${exitCode}): the keychain may be locked, or access to the item was refused. Ask the user to unlock it (security unlock-keychain) or to allow access when macOS asks, then call use_secret again.` }
+    } catch (err) {
+      return { result: `secret-box could not read the Keychain: ${String((err && err.message) || err).slice(0, 200)}. Nothing was loaded.` }
+    }
+  }).catch(() => ({ result: 'secret-box could not read the Keychain. Nothing was loaded.' }))
+
+  // 3d. list_key_names: names only. The pointers in the project's .env files,
+  //     and the Keychain items the box saved (tagged) or whose service starts
+  //     with a listPrefixes entry. The dump it reads holds every item's names,
+  //     so it is filtered here and never handed on whole.
+  on('tool.call', { tool: LIST }, async ($, e, next) => {
+    if ((await platformIn($, memo)) === 'other') return { result: 'list_key_names needs macOS.' }
+    try {
+      return await listKeyNames($, options)
+    } catch {
+      return { result: `${NAMES_ONLY}\nsecret-box could not list them.` }
+    }
+  }).catch(() => ({ result: 'secret-box could not list key names.' }))
+
+  // 3e. migrate_env_to_keychain: move plaintext keys from one .env file into
+  //     the Keychain, each line becoming a pointer only once the Keychain reads
+  //     its value back
+  on('tool.call', { tool: MIGRATE }, async ($, e, next) => {
+    if ((await platformIn($, memo)) === 'other') return { result: 'migrate_env_to_keychain needs macOS. Nothing was changed.' }
+    try {
+      const answer = await migrateEnv($, e, options)
+      return typeof answer === 'string' ? { result: answer } : answer
+    } catch (err) {
+      return { result: `migrate_env_to_keychain stopped before rewriting the file (${String((err && err.message) || err).slice(0, 100)}). The file is unchanged.` }
+    }
+  }).catch(() => ({ result: 'migrate_env_to_keychain failed. The file is unchanged.' }))
+
   // @.env would attach the raw file to your prompt
   on('prompt.mention', { path: /(^|[\\/])\.env(\.[\w.-]+)?$/ }, async ($, e, next) =>
     isEnvFile(e.path) ? { deny: 'secret-box: ask Claude to read .env instead; its secrets come back hidden' } : next(e))
@@ -82,9 +711,18 @@ export function register(on, options) {
   // 4. The box. Claude calls the tool: open it, wait for you, save, answer.
   on('tool.call', { tool: TOOL }, async ($, e, next) => {
     const name = String(e.name || '').trim()
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    // Refuse before anyone types, rather than fall back to a plaintext .env, when
+    // backend keychain was set off macOS, or auto can't tell what this is
+    const platform = await platformIn($, memo)
+    const backend = boxBackend((options || {}).backend, platform)
+    const isKeychain = backend === 'keychain'
+    // .env needs a variable name; the Keychain takes a service (myapp/STRIPE_SECRET_KEY)
+    if (!isKeychain && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
       return { result: `"${name}" is not a valid variable name. Use letters, digits and underscores.` }
     }
+    if (isKeychain && (!name || badName('name', name))) return { result: `"${name}" can't be a Keychain service name. ${badName('name', name) || 'Give one.'}` }
+    if (isKeychain && platform === 'other') return { result: `secret-box's Keychain backend needs macOS, so ${name} was not asked for. Set the backend option to auto or dotenv.` }
+    if (backend === 'unknown') return { result: `secret-box couldn't tell whether this is a Mac (uname didn't answer), so ${name} was not asked for and nothing was written. Ask the user to set the backend option to keychain or dotenv.` }
     // A plain -p run has no one to type into the box
     if ((await $.session.surfaces()).length === 0) {
       return { result: `secret-box needs an interactive session to collect ${name}. Ask the user to run Claude Code interactively.` }
@@ -115,8 +753,27 @@ export function register(on, options) {
     if (!value) return { result: `The user cancelled. ${name} was not saved.` }
 
     try {
+      if (isKeychain) {
+        const account = await defaultAccount($, options)
+        const why = account ? badName('keychainAccount', account) : 'No Keychain account: set the keychainAccount option.'
+        if (why) return { result: `Saving ${name} failed: ${why}` }
+        await saveToKeychain($, name, account, value)
+        const tag = keep(value, itemName(name, account))
+        const pointer = pointerTo(name, account)
+        $.ui.toast(`${name} saved to Keychain`)
+        // The ONLY things Claude learns: the name, the place, and a
+        // placeholder. The user's row gets the one line.
+        const use = howToUse(name, account, value, tag)
+        return {
+          result: use.loaded(`The user entered ${name}, saved to the macOS Keychain (account ${account})`),
+          context: [
+            `${name} is saved as service ${name}, account ${account}; .env was not touched. ${use.guide} In a later session, call use_secret with service ${name} and account ${account}.` +
+              (pointer ? ` For an app that reads .env, write the line ENV_NAME=${pointer} there, never the value, and run the app with ${runnerPath($)} -- COMMAND.` : ''),
+          ],
+        }
+      }
       const where = await saveToDotenv($, await $.session.cwd(), name, value)
-      const tag = keepSecret(value)
+      const tag = keep(value, `${name} in .env`)
       $.ui.toast(`${name} saved to ${where}`)
       // The ONLY things Claude learns: the name, the place, and a placeholder
       return { result: `The user entered ${name}. It was saved to ${where}. You can't see the value. To use it in a command or a file, write ${tag}: it becomes the real value when the tool runs and is hidden again in the output. Code should read it from the environment.` }
@@ -140,6 +797,17 @@ export function register(on, options) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!pending || !pending.isInBand) return next(e)
     return drawBox($, e, pending)
+  })
+
+  // A refusal of secret-box's own, drawn in the user's view as one calm line.
+  // The model still reads the whole text: a refusal can't carry context, so
+  // only its row changes. An errored row draws the error text whatever its
+  // output, so this draws a tree of its own rather than rewrite the output.
+  on('ui.render', { component: 'ToolResult', props: { isErrored: true } }, async ($, e, next) => {
+    const line = calmLine(e.props.output)
+    if (!line) return next(e)
+    const { Text } = $.ui.resolve(e)
+    return <Text dimColor>{line}</Text>
   })
 
   // Escape (or any close) on the pane before Enter means cancel
@@ -173,6 +841,25 @@ export function isNotFound(err) {
   return /ENOENT|not found/i.test(String((err && err.message) || err))
 }
 
+// What the user sees of a refusal secret-box made, by what it was about, or
+// undefined for any other error (a command's own failure is drawn as it is).
+// The model reads the refusal whole; these say only what happened.
+const CALM = [
+  [/the user did not allow this call/, 'secret-box: not run, as you chose.'],
+  [/waits until plan mode ends/, 'secret-box: held until plan mode ends. Claude was asked to put this step in the plan.'],
+  [/no longer holds/, 'secret-box: that was an old placeholder, from before secret-box reloaded. Claude was asked to load the key again.'],
+  [/character the shell reads/, 'secret-box: this key needs another form in a command. Claude was told which.'],
+  [/A pushed key can't be taken back/, 'secret-box: kept a .env file with keys out of git. Claude was told why.'],
+  [/write its service name/, 'secret-box: a .env pointer takes a service name, not a placeholder. Claude was told how to write it.'],
+  [/reads the Keychain, but/, 'secret-box: Claude was asked to load this key with use_secret instead.'],
+]
+export function calmLine(output) {
+  if (typeof output !== 'string') return undefined
+  const text = errorText(output.replace(/^Error: /, ''), undefined)
+  if (!text.startsWith('secret-box: ')) return undefined
+  return (CALM.find(([pattern]) => pattern.test(text)) || [, 'secret-box held this call back to keep a key out of view. Claude was told why.'])[1]
+}
+
 // .env, .env.local, .env.production ... but not .env.example and friends
 export function isEnvFile(path) {
   const base = String(path || '').split(/[\\/]/).pop()
@@ -198,7 +885,8 @@ async function learnDotenv($, files) {
       if (path.startsWith('~/') || !(await $.fs.exists(path))) continue
       for (const m of (await $.fs.read(path)).matchAll(ASSIGNMENT)) {
         const value = m[3].trim().replace(/^["']|["']$/g, '')
-        if (value.length >= 6 && SECRET_NAME.test(m[2])) keepSecret(value)
+        // A pointer only names a Keychain item: it stays readable
+        if (value.length >= 6 && SECRET_NAME.test(m[2]) && !parsePointer(envValue(m[3]))) keep(value, `${m[2]} in ${f}`)
       }
     } catch {}
   }
@@ -221,10 +909,29 @@ function gitDirs(cmd) {
   return [...dirs]
 }
 
-// Why a Bash command must be blocked: it stages or commits a .env file
-async function commitBlockReason($, cmd) {
+// Why a Bash command must be blocked: it stages or commits a .env file. A
+// .env file of pointers may go in (holdsNoKey): it names Keychain items and
+// holds no key. Any file that can't be read and checked is blocked as before.
+async function commitBlockReason($, cmd, cfg, memo) {
+  // Why a .env file can't go in, or '' when it can; one that can't be read can't
+  const keyOf = async (read) => {
+    let text
+    try {
+      text = await read()
+    } catch {
+      return 'it could not be read'
+    }
+    return keyIn($, text, cfg, memo)
+  }
   if (/\bgit\b[^;&|]*\badd\b/.test(cmd) && /\.env\b(?!\.(example|sample|template|dist))/.test(cmd)) {
-    return 'staging a .env file is blocked.'
+    // Only .env files named plainly, in the current folder's repository, can be checked
+    const named = envFiles({ command: cmd })
+    if (/\s-C[\s=]/.test(cmd) || named.length === 0) return 'staging a .env file is blocked.'
+    const cwd = await $.session.cwd()
+    for (const f of named) {
+      const why = await keyOf(() => $.fs.read(isAbsolute(f) ? f : `${cwd}/${f}`))
+      if (why) return `staging a .env file is blocked: ${why}. A .env file can be committed once every key in it is a keychain: pointer to an item the Keychain holds.`
+    }
   }
   if (!/\bgit\b[^;&|]*\bcommit\b/.test(cmd)) return ''
   // The index is read before the command runs. If the same command stages
@@ -235,13 +942,26 @@ async function commitBlockReason($, cmd) {
     const git = (...args) => $.process.run(['git', ...(dir ? ['-C', dir] : []), ...args])
     const checks = [git('diff', '--cached', '--name-only')]
     if (stages) checks.push(git('ls-files', '--modified', '--others', '--exclude-standard'))
-    for (const r of await Promise.all(checks)) {
+    const [index, tree] = await Promise.all(checks)
+    for (const r of [index, tree].filter(Boolean)) {
       if (r.exitCode !== 0) return `could not check what this commit includes${dir ? ' in ' + dir : ''}, so it is blocked.`
-      const env = r.stdout.split('\n').find(isEnvFile)
-      if (env) {
-        return stages
-          ? `this command could stage and commit ${env}. Add it to .gitignore, or stage named files in a separate step.`
-          : 'this commit would include a .env file. Unstage it with git rm --cached.'
+    }
+    // Staged: what the index holds. Paths are from the repository's top.
+    for (const env of index.stdout.split('\n').filter(isEnvFile)) {
+      const staged = async () => {
+        const r = await git('show', `:${env}`)
+        if (r.exitCode !== 0) throw new Error('unreadable')
+        return r.stdout
+      }
+      const why = await keyOf(staged)
+      if (why) return `this commit would include ${env}: ${why}. Unstage it with git rm --cached, or make every key in it a keychain: pointer to an item the Keychain holds.`
+    }
+    // Stageable: the working file. Paths are from the folder git ran in.
+    const base = !dir ? await $.session.cwd() : isAbsolute(dir) ? dir : `${await $.session.cwd()}/${dir}`
+    for (const env of (tree ? tree.stdout.split('\n') : []).filter(isEnvFile)) {
+      const why = await keyOf(() => $.fs.read(`${base}/${env}`))
+      if (why) {
+        return `this command could stage and commit ${env}: ${why}. Add it to .gitignore, or stage named files in a separate step.`
       }
     }
   }

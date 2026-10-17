@@ -33,8 +33,76 @@ const BLOCK_WITHHELD = '[transcript-redactor withheld this text: the scan failed
 // the subagent used. A mod built on this one can add its own tool here.
 export const LIVE_TAG_TOOLS = new Set(['Agent', 'Task'])
 
-// The name on the toast and the tool row. A mod built on this one sets its own.
-export const brand = { name: 'transcript-redactor' }
+// The name on the toast and the tool row, and what two refusals tell the
+// model to do instead. A mod built on this one sets its own.
+export const brand = {
+  name: 'transcript-redactor',
+  // A value holding shell characters can't go into a command as itself
+  shellHint: 'Write it to a file with the Write tool and have the command read that file instead.',
+  // A placeholder the vault no longer holds stands for nothing
+  staleHint: 'Read the value again where it came from to get a fresh placeholder.',
+}
+
+// What a placeholder stands for, by name (a Keychain item, a .env variable),
+// where a mod built on this one knows it. The approval prompt lists these.
+export const tagNames = new Map<string, string>()
+
+// The labels of the approval prompt (tool.check, below)
+const ALLOW = 'Allow'
+const DENY = 'Deny'
+
+// Permission modes in which a call Claude Code would ask about must not run on
+// this file's word. dontAsk refuses what no rule allows, with no dialog, so
+// core's own verdict stands. Plan mode (nothing runs yet) is refused outright
+// (tool.check, below): its ask would open Claude Code's dialog, real values in it.
+const HOLD_MODES = new Set(['dontAsk'])
+// The modes in which, ownPrompt off, such a call is allowed. A mode not seen
+// yet, or one not named here, gets the prompt instead.
+const ALLOW_MODES = new Set(['default', 'acceptEdits', 'auto', 'bypassPermissions'])
+
+const SECRET_TAGS = /\[REDACTED-SECRET-[0-9a-f]{8}\]/g
+
+// The words of an errored call's answer, as the model read them, without the
+// wrapper a refusal is given again
+export function errorText(text: unknown, result: unknown): string {
+  const s = typeof text === 'string' ? text : typeof result === 'string' ? result.replace(/^Error: /, '') : 'The call failed.'
+  const m = /^<tool_use_error>([\s\S]*)<\/tool_use_error>$/.exec(s)
+  return m ? m[1]! : s
+}
+
+// The placeholders in a call's input that restore() can't resolve: minted
+// before this mod last loaded (the vault lives in memory only), or never
+// minted at all. Left in, one reaches the tool as its own text. One that
+// already sits in the file the call edits is that file's text (a placeholder
+// printed into it once), so it can still be edited away.
+async function staleTags(e: Record<string, unknown>, read: (path: string) => Promise<unknown>): Promise<string[]> {
+  const found = new Set<string>()
+  const look = (s: string): string => {
+    for (const t of s.match(SECRET_TAGS) ?? []) if (restore(t) === t) found.add(t)
+    return s
+  }
+  // A command's description is never run
+  walk(e.tool === 'Bash' ? { command: e.command } : argsOf(e), look)
+  const path = e.file_path ?? e.notebook_path
+  if (found.size > 0 && e.tool !== 'Bash' && typeof path === 'string') {
+    let text = ''
+    try {
+      const got = await read(path)
+      if (typeof got === 'string') text = got
+    } catch {}
+    for (const t of [...found]) if (text.includes(t)) found.delete(t)
+  }
+  return [...found]
+}
+
+// A tool call's own arguments: what the permission check reads (`{ command }`
+// for Bash), without the call's envelope
+function argsOf(e: Record<string, unknown>): Record<string, unknown> {
+  const { tool: _tool, tool_use_id: _id, agentId: _agent, requestMeta: _meta, consent: _consent, ...args } = e
+  return args
+}
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 // Attachments that carry text from outside the engine's own prose: a file,
 // a diff of a file, a queued prompt. These get the full scrub, emails too.
@@ -86,6 +154,17 @@ export const register: Register = (on, options) => {
   // Counts the values hidden, not the placeholders that stand for quoted text.
   const countHidden = (tags: Set<string>): number => [...tags].filter((t) => !t.startsWith('[REDACTED-LITERAL-')).length
 
+  // ownApproval (on unless set off): the permission check of a call this file
+  // filled with real values is answered on the call as Claude wrote it, so the
+  // real values never reach the approval dialog or the auto-mode classifier.
+  const ownApproval = ![false, 'false'].includes((options as Record<string, unknown>).ownApproval as never)
+  // ownPrompt (off unless set on): such a call that the user's rules don't
+  // decide gets this file's own Allow/Deny prompt. Off, it is allowed.
+  const ownPrompt = [true, 'true'].includes((options as Record<string, unknown>).ownPrompt as never)
+  // The calls running now with real values put in, by tool_use_id: the call
+  // as Claude wrote it (placeholders and all) and the placeholders put back.
+  const filled = new Map<string, { input: Record<string, unknown>; tags: string[] }>()
+
   // 1. What the user types. A pasted key never reaches the model as itself,
   //    and neither does the context a hook above attached to the prompt.
   on('prompt.submit', async ($, e, next) => {
@@ -110,15 +189,32 @@ export const register: Register = (on, options) => {
     const command = (e as { command?: unknown }).command
     const publishes = e.tool === 'Bash' && typeof command === 'string' && PUBLISHES.test(command)
     const isLocal = cfg.restore && cfg.restoreTools.has(e.tool) && !publishes
+    // A placeholder the vault no longer holds would run as its own text, with
+    // no error: the call is refused before anything runs
+    const stale = isLocal ? await staleTags(e as Record<string, unknown>, (path) => $.fs.read(path)) : []
+    if (stale.length > 0) {
+      const one = stale.length === 1
+      return {
+        deny:
+          `${brand.name}: ${stale.join(', ')} ${one ? 'is a placeholder' : 'are placeholders'} ${brand.name} no longer holds: ` +
+          `${one ? 'it is' : 'they are'} from before ${brand.name} last reloaded, so the call would have used the placeholder text itself. ` +
+          `Nothing ran. ${brand.staleHint}`,
+      }
+    }
     // The real values this call was handed. Whatever the tool prints of them
     // comes back hidden, even bare and short, where no detector would fire.
     const handed = new Set<string>()
+    // The placeholders put back, for the permission check (tool.check, below)
+    const used = new Set<string>()
     const restoreTracked = (s: string): string =>
       restore(s) === s
         ? s
         : s.replace(/\[REDACTED-SECRET-[0-9a-f]{8}\]/g, (t) => {
             const v = restore(t)
-            if (v !== t) handed.add(v)
+            if (v !== t) {
+              handed.add(v)
+              used.add(t)
+            }
             return v
           })
     const rehideHanded = (text: string): string => {
@@ -129,10 +225,20 @@ export const register: Register = (on, options) => {
     const input = isLocal ? (walk({ ...e }, restoreTracked) as typeof e) : e
     if (e.tool === 'Bash' && [...handed].some((v) => SHELL_ACTIVE.test(v))) {
       return {
-        deny: `${brand.name}: a secret in this command holds shell characters, so its real value was not put into Bash, where it could run as code. Write it to a file with the Write tool and have the command read that file instead.`,
+        deny: `${brand.name}: a key in this command holds a space, a quote or another character the shell reads, so it was not put into the command, where the shell would change it. Nothing ran. ${brand.shellHint}`,
       }
     }
-    const r = await next(input)
+    // The permission check runs inside next(): it is told of this call until
+    // the call ends or is refused
+    const id = e.tool_use_id
+    const isFilled = ownApproval && used.size > 0 && typeof id === 'string'
+    if (isFilled) filled.set(id, { input: argsOf(e), tags: [...used] })
+    let r: Awaited<ReturnType<typeof next>>
+    try {
+      r = await next(input)
+    } finally {
+      if (isFilled) filled.delete(id)
+    }
     if (r.deny !== undefined) {
       // A refusal from beneath may quote the input it refused, real values
       // and all, and the model reads it as the tool's answer.
@@ -164,17 +270,89 @@ export const register: Register = (on, options) => {
 
     const n = countHidden(tags)
     if (cfg.notify && n > 0) $.ui.notice(e.tool_use_id, `${brand.name}: hid ${n} value(s)`)
+    // An errored call can be answered only as core answered it or as a
+    // refusal: any other answer is checked against the tool's output shape,
+    // which an error's text never fits ("expected object, received string"),
+    // and that check's failure replaces the answer. So a rewritten error goes
+    // back as a refusal holding it. (A refusal carries no context; core gives
+    // an errored call none.)
+    if (r.isError) return { deny: errorText(value.text, value.result) }
     const context = value.context ? { context: value.context } : {}
-    if (r.isError) return { isError: true as const, result: value.result, text: value.text, ...context }
     return { result: value.result, ...context } as typeof r
-  }).catch(async ($, e, next) => {
-    // Nothing ran yet: refuse the call. The tool answered: withhold it.
-    if (!next.called) return { deny: WITHHELD }
-    const r = await next(e)
-    if (r.deny !== undefined) return { deny: WITHHELD }
-    if (r.isError) return { isError: true as const, result: WITHHELD, text: WITHHELD }
-    return { deny: WITHHELD }
-  })
+  }).catch(() =>
+    // Nothing ran yet: the call is refused. The tool answered: its answer is
+    // withheld (an errored one can only be withheld this way, as above).
+    ({ deny: WITHHELD }),
+  )
+
+  // 2b. The permission check of a call that tool.call above filled with real
+  //     values. Claude Code checks the call as it will run, real values and
+  //     all, so its dialog would show them and the auto-mode classifier would
+  //     read them. Only for such a call (a query, with no tool_use_id, passes):
+  //       1. Core's verdict first. Its allow or deny stands.
+  //       2. On ask: the user's own rules, asked about the call as written.
+  //       3. Plan mode: refused, so Claude Code's dialog never opens with
+  //          the real values in it. The step waits for the plan to end.
+  //       4. No one to ask (-p): core's verdict goes on unchanged. In
+  //          dontAsk mode too: the mode settles it as it would any call.
+  //       5. ownPrompt off, in a mode known to allow asking: allowed, so the
+  //          user isn't asked about every command that uses a key. The
+  //          auto-mode classifier then doesn't read the command at all.
+  //       6. Otherwise (ownPrompt on, or the mode not known yet): the person,
+  //          shown the call as written, picks Allow or Deny. Anything but
+  //          Allow (a dismissal, typed text) is a deny.
+  //     A hook that fails leaves core's verdict.
+  if (ownApproval && cfg.restore && cfg.restoreTools.size > 0) {
+    // The permission mode each loop runs in, by agentId ('' for the main
+    // one), as the last classic hook event from that loop gave it: tool.check
+    // itself isn't told the mode. SubagentStart and SubagentStop are left
+    // out, since they may give the parent's.
+    const modes = new Map<string, string>()
+    const noteMode = (e: unknown): void => {
+      const { permission_mode: mode, agent_id: agent } = e as { permission_mode?: unknown; agent_id?: unknown }
+      if (typeof mode === 'string') modes.set(typeof agent === 'string' ? agent : '', mode)
+    }
+    on('classic.SessionStart', ($, e, next) => (noteMode(e), next(e)))
+    on('classic.UserPromptSubmit', ($, e, next) => (noteMode(e), next(e)))
+    on('classic.PostToolUse', ($, e, next) => (noteMode(e), next(e)))
+    on('classic.PostToolUseFailure', ($, e, next) => (noteMode(e), next(e)))
+
+    const tools = new RegExp(`^(?:${[...cfg.restoreTools].map(escapeRe).join('|')})$`)
+    on('tool.check', { tool: tools }, async ($, e, next) => {
+      const call = e.tool_use_id === undefined ? undefined : filled.get(e.tool_use_id)
+      const core = await next(e)
+      if (!call || core.decision !== 'ask') return core
+      try {
+        const rules = await $.tool.check({ tool: e.tool, input: call.input })
+        if (rules.decision === 'allow' || rules.decision === 'deny') return rules
+      } catch {}
+      const mode = modes.get(e.agentId ?? '')
+      if (mode === 'plan') {
+        const what = e.tool === 'Bash' ? 'a command' : 'a file change'
+        return { decision: 'deny', reason: `${brand.name}: ${what} that uses a key waits until plan mode ends. Put this step in the plan instead of running it.` }
+      }
+      if ((await $.session.surfaces()).length === 0) return core
+      if (mode !== undefined && HOLD_MODES.has(mode)) return core
+      const many = call.tags.length > 1
+      if (!ownPrompt && mode !== undefined && ALLOW_MODES.has(mode)) {
+        return { decision: 'allow', reason: `${brand.name}: allowed; it fills in ${many ? 'the keys' : 'the key'} from ${many ? 'their placeholders' : 'its placeholder'} only while the call runs` }
+      }
+      const names = call.tags.map((t) => (tagNames.has(t) ? `${tagNames.get(t)} (${t})` : t)).join(', ')
+      const isBash = e.tool === 'Bash' && typeof call.input.command === 'string'
+      const shown = isBash ? String(call.input.command) : JSON.stringify(call.input, null, 2)
+      const how = isBash
+        ? `The ${many ? 'keys are' : 'key is'} filled in only while it runs, and no one sees ${many ? 'them' : 'it'}. Allow this command?`
+        : `The ${many ? 'keys go' : 'key goes'} into the file; the chat only ever shows the placeholder. Allow this ${e.tool}?`
+      const question = `${shown}\n\nIt uses ${names}. ${how}`
+      let answer = ''
+      try {
+        answer = await $.ui.ask(question, { options: [ALLOW, DENY], header: brand.name.slice(0, 12) })
+      } catch {}
+      if (answer === ALLOW) return { decision: 'allow', reason: `${brand.name}: the user allowed this call in its approval prompt` }
+      // No placeholder in the reason: the model reads it as the call's error
+      return { decision: 'deny', reason: `${brand.name}: the user did not allow this call. Ask them what to do; don't retry it in another form.` }
+    }).catch(($, e, next) => next(e))
+  }
 
   // 3. The blocks attached to the first message (CLAUDE.md and friends).
   //    Secrets only: the email in there is the user's own, and the engine
