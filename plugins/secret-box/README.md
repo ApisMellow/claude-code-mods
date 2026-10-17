@@ -151,8 +151,8 @@ Claude Code checks a call's permission after secret-box has put the real values 
 
 1. Claude Code's own verdict comes first. If your rules, the mode or a hook allow or deny the call, that stands.
 2. If Claude Code would ask, secret-box asks your permission rules about the call as written, placeholders and all. A rule that allows or denies it decides.
-3. With no one to ask (`claude -p`), Claude Code's verdict goes on unchanged.
-4. In plan mode and dontAsk mode, Claude Code's verdict goes on too, so the mode settles the call as it would any other. secret-box never allows a call there.
+3. In plan mode, secret-box refuses the call, so Claude Code's own dialog never opens with the key in it. Claude is told the step waits until plan mode ends and to put it in the plan instead.
+4. With no one to ask (`claude -p`), Claude Code's verdict goes on unchanged. In dontAsk mode it does too, and the mode refuses the call as it would any other, with no dialog. secret-box never allows a call there.
 5. Otherwise secret-box allows the call, so you aren't asked about every command that uses a key. The key is filled in only while the call runs, and nothing you or Claude see shows it.
 6. With `ownPrompt` on, secret-box asks you instead, in its own short prompt: the call as written, with placeholders, and the keys it uses, never their values. Anything but Allow, closing the prompt included, refuses the call. It also asks, whatever `ownPrompt` says, if it hasn't yet learned which permission mode the session is in.
 
@@ -190,7 +190,7 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 | `redactPrivateIps` | `false` | With `pii` on, also hide private and reserved IPs recognized by the detector |
 | `restoreInToolInputs` | `true` | Turn placeholders back into real values before a tool runs |
 | `restoreTools` | `Bash,Write,Edit,MultiEdit,NotebookEdit` | The tools that may receive a real value. Tools that send data off the machine are left out on purpose |
-| `ownApproval` | `true` | Decide the approval of a call that got real values on the call as written: your rules first, then an allow, or secret-box's own prompt with `ownPrompt` on (see Approving calls that use a key). In plan and dontAsk modes Claude Code's verdict stands. Off, Claude Code checks the call with the real values in it |
+| `ownApproval` | `true` | Decide the approval of a call that got real values on the call as written: your rules first, then an allow, or secret-box's own prompt with `ownPrompt` on (see Approving calls that use a key). In plan mode it refuses the call; in dontAsk mode Claude Code's verdict stands. Off, Claude Code checks the call with the real values in it |
 | `ownPrompt` | `false` | With `ownApproval` on, ask you in secret-box's own prompt before a call that uses a key, when your rules don't decide it. Off, such a call is allowed, and auto mode's classifier skips the whole command |
 | `notify` | `true` | A count on the tool row, a toast on a prompt |
 | `minEntropy` | `3.6` | Bits per character for the high-entropy test |

@@ -48,7 +48,7 @@ STRIPE_SECRET_KEY=keychain:myapp/STRIPE_SECRET_KEY?account=work
 
 ## Approval and permission rules
 
-- A call that uses a placeholder is approved on the call as written, with placeholders, so no dialog shows a key: the user's permission rules first, then secret-box allows it (or, with its `ownPrompt` setting on, asks the user). In plan and dontAsk modes Claude Code's own answer stands. Never put a key's value into a command to get past a check. If a call is refused, ask the user what to do; don't retry it in another form.
+- A call that uses a placeholder is approved on the call as written, with placeholders, so no dialog shows a key: the user's permission rules first, then secret-box allows it (or, with its `ownPrompt` setting on, asks the user). In plan mode such a call is refused: put the step in the plan instead of running it. In dontAsk mode Claude Code's own answer stands. Never put a key's value into a command to get past a check. If a call is refused, ask the user what to do; don't retry it in another form.
 - If secret-box says a placeholder is from before it reloaded, call `use_secret` (or `request_secret`) for that key again and use the new placeholder.
 - An app run through `keychain-env` is checked like any other command, and auto mode may refuse it as credential access. Offer the user one allow rule for the runner, for the project's `.claude/settings.local.json` (machine-specific, since it holds the runner's absolute path). Give them the exact line, with the absolute path from `use_secret` or `list_key_names` filled in:
   ```json

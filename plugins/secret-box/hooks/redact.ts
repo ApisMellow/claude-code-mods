@@ -52,9 +52,10 @@ const ALLOW = 'Allow'
 const DENY = 'Deny'
 
 // Permission modes in which a call Claude Code would ask about must not run on
-// this file's word: plan (nothing runs yet) and dontAsk (refuse what no rule
-// allows). Core's own verdict stands in them.
-const HOLD_MODES = new Set(['plan', 'dontAsk'])
+// this file's word. dontAsk refuses what no rule allows, with no dialog, so
+// core's own verdict stands. Plan mode (nothing runs yet) is refused outright
+// (tool.check, below): its ask would open Claude Code's dialog, real values in it.
+const HOLD_MODES = new Set(['dontAsk'])
 // The modes in which, ownPrompt off, such a call is allowed. A mode not seen
 // yet, or one not named here, gets the prompt instead.
 const ALLOW_MODES = new Set(['default', 'acceptEdits', 'auto', 'bypassPermissions'])
@@ -290,9 +291,10 @@ export const register: Register = (on, options) => {
   //     read them. Only for such a call (a query, with no tool_use_id, passes):
   //       1. Core's verdict first. Its allow or deny stands.
   //       2. On ask: the user's own rules, asked about the call as written.
-  //       3. No one to ask (-p): core's verdict goes on unchanged.
-  //       4. Plan or dontAsk mode: core's verdict goes on, so the mode
-  //          settles it as it would any call (never allowed here).
+  //       3. Plan mode: refused, so Claude Code's dialog never opens with
+  //          the real values in it. The step waits for the plan to end.
+  //       4. No one to ask (-p): core's verdict goes on unchanged. In
+  //          dontAsk mode too: the mode settles it as it would any call.
   //       5. ownPrompt off, in a mode known to allow asking: allowed, so the
   //          user isn't asked about every command that uses a key. The
   //          auto-mode classifier then doesn't read the command at all.
@@ -324,8 +326,12 @@ export const register: Register = (on, options) => {
         const rules = await $.tool.check({ tool: e.tool, input: call.input })
         if (rules.decision === 'allow' || rules.decision === 'deny') return rules
       } catch {}
-      if ((await $.session.surfaces()).length === 0) return core
       const mode = modes.get(e.agentId ?? '')
+      if (mode === 'plan') {
+        const what = e.tool === 'Bash' ? 'a command' : 'a file change'
+        return { decision: 'deny', reason: `${brand.name}: ${what} that uses a key waits until plan mode ends. Put this step in the plan instead of running it.` }
+      }
+      if ((await $.session.surfaces()).length === 0) return core
       if (mode !== undefined && HOLD_MODES.has(mode)) return core
       const many = call.tags.length > 1
       if (!ownPrompt && mode !== undefined && ALLOW_MODES.has(mode)) {

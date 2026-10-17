@@ -214,6 +214,7 @@ test('migrate: the report is the row; how to run the app is in the context', asy
 
 const REFUSALS: [string, string][] = [
   ['secret-box: the user did not allow this call. Ask them what to do', 'secret-box: not run, as you chose.'],
+  ['secret-box: a command that uses a key waits until plan mode ends. Put this step in the plan instead of running it.', 'secret-box: held until plan mode ends.'],
   [`secret-box: ${STALE} is a placeholder secret-box no longer holds: it is from before`, 'secret-box: that was an old placeholder'],
   ['secret-box: a key in this command holds a space, a quote or another character the shell reads, so', 'secret-box: this key needs another form'],
   ["secret-box: staging a .env file is blocked. A pushed key can't be taken back.", 'secret-box: kept a .env file with keys out of git.'],

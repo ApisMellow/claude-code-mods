@@ -73,7 +73,7 @@
     "ownApproval": {
       "type": "boolean",
       "title": "Approve calls with real values itself",
-      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders, so no dialog or classifier sees a key: your permission rules first, then (see ownPrompt) an allow or secret-box's own prompt. In plan and dontAsk modes Claude Code's own answer stands. Off, Claude Code asks about the call with the real values in it, as before",
+      "description": "When a call that got real values put back would need approval, decide it on the call as written, with placeholders, so no dialog or classifier sees a key: your permission rules first, then (see ownPrompt) an allow or secret-box's own prompt. In plan mode such a call is refused until the plan ends; in dontAsk mode Claude Code's own answer stands. Off, Claude Code asks about the call with the real values in it, as before",
       "default": true
     },
     "ownPrompt": {

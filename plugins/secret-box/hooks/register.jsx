@@ -846,6 +846,7 @@ export function isNotFound(err) {
 // The model reads the refusal whole; these say only what happened.
 const CALM = [
   [/the user did not allow this call/, 'secret-box: not run, as you chose.'],
+  [/waits until plan mode ends/, 'secret-box: held until plan mode ends. Claude was asked to put this step in the plan.'],
   [/no longer holds/, 'secret-box: that was an old placeholder, from before secret-box reloaded. Claude was asked to load the key again.'],
   [/character the shell reads/, 'secret-box: this key needs another form in a command. Claude was told which.'],
   [/A pushed key can't be taken back/, 'secret-box: kept a .env file with keys out of git. Claude was told why.'],

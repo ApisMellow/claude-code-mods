@@ -3,7 +3,7 @@
 // dialog or classifier sees a key. Core's verdict first, then the user's
 // rules; then, ownPrompt off (the default), an allow in a mode known to allow
 // asking, or, ownPrompt on (or the mode not known), secret-box's own prompt.
-// In plan and dontAsk modes core's verdict stands.
+// In dontAsk mode core's verdict stands; in plan mode the call is refused.
 import { expect, mock, test } from 'claude-code/testing'
 
 import { SECURITY } from '../hooks/keychain'
@@ -150,18 +150,56 @@ for (const options of [{ ownPrompt: false }, { ownPrompt: true }]) {
     expect(w.ran).toEqual([])
   })
 
-  // Plan and dontAsk mean "don't run this unless already allowed": the mode
-  // settles core's ask as it would any call's, so nothing is allowed here
-  for (const mode of ['plan', 'dontAsk']) {
-    test(`${mode} mode: core's verdict stands, never an allow and never a prompt ${JSON.stringify(options)}`, { options }, async ($, on) => {
-      const w: World = { core: 'ask', rules: 'ask', answer: 'Allow', mode, verdicts: [], asked: [], ran: [] }
+  // dontAsk refuses what no rule allows, with no dialog: the mode settles
+  // core's ask as it would any call's, so nothing is allowed here
+  test(`dontAsk mode: core's verdict stands, never an allow and never a prompt ${JSON.stringify(options)}`, { options }, async ($, on) => {
+    const w: World = { core: 'ask', rules: 'ask', answer: 'Allow', mode: 'dontAsk', verdicts: [], asked: [], ran: [] }
+    const tag = await loaded($, on, w)
+    await call($, { tool: 'Bash', command: curl(tag) })
+    expect(w.verdicts!.map((v) => v.decision)).toEqual(['ask'])
+    expect(w.asked).toEqual([])
+    expect(w.ran).toEqual([])
+  })
+
+  // Plan mode: core's ask would open Claude Code's own dialog with the real
+  // value in it, so the call is refused, calmly, whoever is there to ask
+  for (const surfaces of [['terminal'], []]) {
+    test(`plan mode: a call no rule decides is refused, never asked about ${JSON.stringify(options)}${surfaces.length ? '' : ', no surface'}`, { options }, async ($, on) => {
+      const w: World = { core: 'ask', rules: 'ask', answer: 'Allow', mode: 'plan', surfaces, verdicts: [], asked: [], ran: [] }
       const tag = await loaded($, on, w)
-      await call($, { tool: 'Bash', command: curl(tag) })
-      expect(w.verdicts!.map((v) => v.decision)).toEqual(['ask'])
+      const r = await call($, { tool: 'Bash', command: curl(tag) })
+      expect(w.verdicts!.map((v) => v.decision)).toEqual(['deny'])
+      expect(w.verdicts![0]!.reason).toBe('secret-box: a command that uses a key waits until plan mode ends. Put this step in the plan instead of running it.')
       expect(w.asked).toEqual([])
       expect(w.ran).toEqual([])
+      expect(JSON.stringify(r)).not.toContain(VALUE)
     })
   }
+}
+
+test('plan mode: a file change that uses a key is refused the same way', async ($, on) => {
+  const w: World = { core: 'ask', rules: 'ask', mode: 'plan', verdicts: [], asked: [] }
+  const tag = await loaded($, on, w)
+  await call($, { tool: 'Write', file_path: '/repo/k.txt', content: `KEY=${tag}\n` })
+  expect(w.verdicts![0]!.decision).toBe('deny')
+  expect(w.verdicts![0]!.reason).toStartWith('secret-box: a file change that uses a key waits until plan mode ends.')
+  expect(w.asked).toEqual([])
+})
+
+// In plan mode, core's verdict and then the user's rules still come first
+for (const [name, given, decision] of [
+  ['core allows', { core: 'allow', rules: 'ask' }, 'allow'],
+  ['core denies', { core: 'deny', rules: 'allow' }, 'deny'],
+  ['the rules allow', { core: 'ask', rules: 'allow' }, 'allow'],
+] as [string, World, Decision][]) {
+  test(`plan mode: ${name}, and that stands`, async ($, on) => {
+    const w: World = { ...given, mode: 'plan', verdicts: [], asked: [] }
+    const tag = await loaded($, on, w)
+    await call($, { tool: 'Bash', command: curl(tag) })
+    expect(w.verdicts!.map((v) => v.decision)).toEqual([decision])
+    expect(w.verdicts![0]!.reason ?? '').not.toContain('plan mode ends')
+    expect(w.asked).toEqual([])
+  })
 }
 
 // ------------------------------------------------- ownPrompt off (default)
@@ -187,7 +225,7 @@ test('ownPrompt off: the latest mode reported counts, so plan after default hold
   const tag = await loaded($, on, w)
   await prompted($, 'plan')
   await call($, { tool: 'Bash', command: curl(tag) })
-  expect(w.verdicts!.map((v) => v.decision)).toEqual(['ask'])
+  expect(w.verdicts!.map((v) => v.decision)).toEqual(['deny'])
   expect(w.ran).toEqual([])
 })
 
