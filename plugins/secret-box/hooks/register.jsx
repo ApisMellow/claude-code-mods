@@ -1027,7 +1027,7 @@ async function commitBlockReason($, vault, cmd, cfg, memo) {
     const cwd = await $.session.cwd()
     for (const f of named) {
       const why = await keyOf(() => $.fs.read(isAbsolute(f) ? f : `${cwd}/${f}`))
-      if (why) return `staging a .env file is blocked: ${why}. A .env file can be committed once every key in it is a keychain: pointer to an item the Keychain holds.`
+      if (why) return `staging a .env file is blocked: ${why}. A .env file can be committed once every key in it is a keychain: pointer to an item ${vault.the} holds.`
     }
   }
   if (!/\bgit\b[^;&|]*\bcommit\b/.test(cmd)) return ''
@@ -1051,7 +1051,7 @@ async function commitBlockReason($, vault, cmd, cfg, memo) {
         return r.stdout
       }
       const why = await keyOf(staged)
-      if (why) return `this commit would include ${env}: ${why}. Unstage it with git rm --cached, or make every key in it a keychain: pointer to an item the Keychain holds.`
+      if (why) return `this commit would include ${env}: ${why}. Unstage it with git rm --cached, or make every key in it a keychain: pointer to an item ${vault.the} holds.`
     }
     // Stageable: the working file. Paths are from the folder git ran in.
     const base = !dir ? await $.session.cwd() : isAbsolute(dir) ? dir : `${await $.session.cwd()}/${dir}`

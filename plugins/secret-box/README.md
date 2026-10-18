@@ -110,7 +110,7 @@ It prompts for the value with the typing hidden, saves it under your Windows use
 - **One account per service.** A target name is unique, so variants of one key (personal, work) need different services (`openai`, `openai/work`), not different accounts. Saving a service that is held under another account is refused rather than overwritten; a pointer's `?account=` must match the item's user name.
 - **2560 bytes per value** (Credential Manager's limit). The mod stores UTF-16LE as `cmdkey` does, or UTF-8 for an ASCII value too long for that, and reads both, so items other tools wrote in either encoding read as they are.
 - **Line endings.** `bin/keychain-env` and `bin/credman` are bash scripts; `.gitattributes` keeps them LF on a checkout with `core.autocrlf` on, which Git for Windows sets by default.
-- **Constrained Language Mode.** Where device policy (AppLocker, WDAC) puts PowerShell in Constrained Language Mode, `credman.ps1` can't load its Credential Manager calls and every read fails; set `backend` to `dotenv` there.
+- **Managed machines.** Where device policy (AppLocker, WDAC) puts PowerShell in Constrained Language Mode, `credman.ps1` can't load its Credential Manager calls, and where Group Policy sets the execution policy, `-ExecutionPolicy Bypass` is overridden and the script won't run. Either way every read fails with a plain error; set `backend` to `dotenv` there.
 - Paths Claude is given use forward slashes (`C:/Users/…/bin/keychain-env`), which Git Bash takes and a backslash path would not survive. The allow rule for the runner is `Bash(C:/path/to/secret-box/bin/keychain-env:*)`.
 
 ## .env pointers and keychain-env (macOS and Windows)
