@@ -1,13 +1,15 @@
 #!/bin/bash
 # keychain-env: run a command with the keys its .env pointers name, read from
-# the macOS Keychain and set in its environment.
+# the macOS Keychain (or, under Git Bash on Windows, Credential Manager) and
+# set in its environment.
 #
 #   keychain-env [--env-file PATH]... -- COMMAND [ARG]...
 #
 # A pointer is a .env line NAME=keychain:SERVICE or
 # NAME=keychain:SERVICE?account=ACCOUNT, printable ASCII, with anything outside
 # A-Z a-z 0-9 . _ ~ : @ / + , ; = ! * - percent-encoded (%20 for a space).
-# Each is read with /usr/bin/security and exported as NAME; then COMMAND runs
+# Each is read with /usr/bin/security (on Windows, credman beside this file)
+# and exported as NAME; then COMMAND runs
 # in this process's place. Lines that aren't pointers are left to the app's own
 # .env loader, which (in most libraries) won't override what is already set.
 # With no --env-file, ./.env is read when it exists.
@@ -20,6 +22,11 @@
 # wherever the app prints it.
 
 SECURITY=/usr/bin/security
+# Git Bash on Windows: Credential Manager, through bin/credman
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CREDMAN=$here/credman
+windows=
+case $(uname -s 2>/dev/null) in MINGW* | MSYS* | CYGWIN*) windows=1 ;; esac
 
 die() {
   printf 'keychain-env: %s\n' "$1" >&2
@@ -89,6 +96,20 @@ for file in ${files[@]+"${files[@]}"}; do
     args=(-s "$service")
     [ -n "$account" ] && args+=(-a "$account")
     where="service '$service'${account:+, account '$account'}"
+
+    if [ -n "$windows" ]; then
+      # credman get prints printable ASCII as it is and refuses (3) anything else
+      value=$("$CREDMAN" get "${args[@]}" 2>/dev/null)
+      case $? in
+        0) ;;
+        44) die "$name: no Credential Manager item for $where. Add it in your own terminal window with: powershell -NoProfile -ExecutionPolicy Bypass -File \"$(cd "$here" && pwd -W)/credman.ps1\" add -Service '$service' -Account '${account:-$USERNAME}'" ;;
+        3) die "$name: the value in $where holds a newline, a tab or a non-ASCII character, so it is not set. Store it base64-encoded instead." ;;
+        *) die "$name: could not read $where from Credential Manager" ;;
+      esac
+      export "$name=$value"
+      unset value
+      continue
+    fi
 
     # -g says on stderr how the value is printed: "text", or 0xHEX "copy"
     shown=$("$SECURITY" find-generic-password "${args[@]}" -g 2>&1 >/dev/null) ||

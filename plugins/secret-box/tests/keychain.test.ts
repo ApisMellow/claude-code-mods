@@ -491,11 +491,12 @@ test('with no /usr/bin/uname, /bin/uname answers', async ($, on) => {
   expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
 })
 
-test("Windows says so in OS, and uname never runs", async ($, on) => {
+test("Windows says so in OS, uname never runs, and the tools are Credential Manager's", async ($, on) => {
   const argvs: string[][] = []
   const specs = await registered($, on, { env: { OS: 'Windows_NT', USER: 'tester' }, argvs })
-  expect(specs.map((s) => s.name)).toEqual(['request_secret'])
-  expect(specs[0]!.description).toBe(UPSTREAM_DESCRIPTION)
+  expect(specs.map((s) => s.name)).toEqual(MAC_TOOLS)
+  expect(specs[0]!.description).toContain('Windows Credential Manager')
+  expect(specs[0]!.description).not.toContain('macOS')
   expect(argvs.filter((a) => a[0]!.endsWith('uname'))).toEqual([])
 })
 

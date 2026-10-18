@@ -19,15 +19,16 @@ export const MIN_HIDDEN = 8
 // a Bash command, since it could run there as code. A test pins the two together.
 export const SHELL_ACTIVE = /[\s$`"'\\;&|<>()*?[\]{}#~]|[\x00-\x1f\x7f]/
 
-// Whether this is a Mac: 'mac', 'other', or 'unknown' when it can't be told.
-// The mods API has no platform call: Windows says so in OS; anything else
-// answers uname, run by its full path so nothing on PATH stands in for it.
-// Where neither uname is there (NixOS, Termux), every Mac has macOS's version
-// file; only if that can't be checked either is the platform unknown.
+// Which vault this machine has: 'mac' (the Keychain), 'windows' (Credential
+// Manager), 'other', or 'unknown' when it can't be told. The mods API has no
+// platform call: Windows says so in OS; anything else answers uname, run by
+// its full path so nothing on PATH stands in for it. Where neither uname is
+// there (NixOS, Termux), every Mac has macOS's version file; only if that
+// can't be checked either is the platform unknown.
 export const MACOS_VERSION_FILE = '/System/Library/CoreServices/SystemVersion.plist'
 export async function platformOf($) {
   try {
-    if ((await $.env.get('OS')) === 'Windows_NT') return 'other'
+    if ((await $.env.get('OS')) === 'Windows_NT') return 'windows'
   } catch {}
   for (const uname of ['/usr/bin/uname', '/bin/uname']) {
     try {
@@ -45,9 +46,11 @@ export async function platformOf($) {
 
 // Where the box saves: keychain, dotenv, or unknown when `auto` (and any value
 // that is neither) meets a platform that can't be told. The box saves nowhere then.
+// `keychain` is the system's vault: the Keychain on macOS, Credential Manager
+// on Windows.
 export function boxBackend(choice, platform) {
   if (choice === 'keychain' || choice === 'dotenv') return choice
-  return platform === 'mac' ? 'keychain' : platform === 'other' ? 'dotenv' : 'unknown'
+  return platform === 'mac' || platform === 'windows' ? 'keychain' : platform === 'other' ? 'dotenv' : 'unknown'
 }
 
 // A service or account goes into argv and into a command you paste into a
@@ -309,12 +312,15 @@ export const READ_ENV = ['USER', 'LOGNAME', 'HOME']
 const MATCH = { generic: 'acCDGjls', internet: 'acCdDjlpPrst' }
 const READS = ['find-generic-password', 'find-internet-password']
 const MENTION = /find-(?:generic|internet)-password|dump-keychain|keychain-env/g
+// On Windows, bin/credman (Git Bash) and bin/credman.ps1 are what read an item
+const CREDMAN_MENTION = /credman|keychain-env/gi
+const isCredman = (w) => typeof w === 'string' && /(?:^|[\\/])credman(?:\.ps1)?$/i.test(w)
 const unknown = (why) => ({ unknown: why })
 const unknowable = unknown('a word in it is only known when it runs')
 
-// The runner, by name or by any path to it
+// The runner, by name or by any path to it (C:\x\keychain-env too)
 const RUNNER = 'keychain-env'
-const isRunner = (w) => typeof w === 'string' && (w === RUNNER || w.endsWith('/' + RUNNER))
+const isRunner = (w) => typeof w === 'string' && (w === RUNNER || w.endsWith('/' + RUNNER) || w.endsWith('\\' + RUNNER))
 // Commands that run the command they are given, so a runner after one is run
 const WRAPPERS = ['sudo', 'env', 'exec', 'command', 'nohup', 'nice', 'xargs', 'bash', 'sh', 'zsh']
 
@@ -332,17 +338,22 @@ const command = (words) => {
 // (sudo, env, VAR=x) that could change whose Keychain it reads, a relative
 // keychain file, `security -i` or `dump-keychain`, a runner whose .env can't
 // be known, or a read that isn't a command of its own (inside quotes for
-// `sh -c`). `env` holds READ_ENV's values.
-export function keychainReads(cmd, env = {}) {
+// `sh -c`). `env` holds READ_ENV's values. With `windows`, the reads are
+// bin/credman's (credRead's { kind: 'credman', service, account }), and a
+// `security` command is nothing: Windows has none.
+export function keychainReads(cmd, env = {}, { windows = false } = {}) {
   const text = String(cmd || '')
   const ctx = { text, env, commands: [], comments: [] }
   lex(text, 0, '', ctx)
   const reads = new Map()
   const add = (read) => reads.set(JSON.stringify(read), read)
+  const readsOf = windows ? credmanReadOf : readOf
+  const mention = windows ? CREDMAN_MENTION : MENTION
+  const isMention = windows ? (w) => isCredman(w) || isRunner(w) : (w) => READS.includes(w) || w === 'dump-keychain' || isRunner(w)
   let seen = 0
   for (const words of ctx.commands) {
-    seen += words.filter((w) => READS.includes(w) || w === 'dump-keychain' || isRunner(w)).length
-    for (const read of commandReads(words)) add(read)
+    seen += words.filter(isMention).length
+    for (const read of commandReads(words, readsOf)) add(read)
   }
   // A mention outside a comment that isn't a word of its own: inside quotes, or glued to others
   let code = ''
@@ -352,7 +363,7 @@ export function keychainReads(cmd, env = {}) {
     from = end
   }
   code += text.slice(from)
-  if ((code.match(MENTION) || []).length > seen) add(unknown('part of it could not be parsed'))
+  if ((code.match(mention) || []).length > seen) add(unknown('part of it could not be parsed'))
   // The runner reads ./.env from the shell's folder: a cd before it moves that
   if (ctx.commands.some((w) => ['cd', 'pushd', 'popd'].includes(command(w)[0]))) {
     for (const [key, read] of reads) {
@@ -367,25 +378,25 @@ export function keychainReads(cmd, env = {}) {
 
 // What one simple command reads: the runner's .env files and the command it
 // runs, or the command's own read
-function commandReads(all) {
+function commandReads(all, readsOf) {
   const words = command(all)
-  if (isRunner(words[0])) return runnerReads(words.slice(1))
-  if (words.slice(1).some(isRunner) && (words[0] === null || WRAPPERS.includes(String(words[0]).split('/').pop()))) {
+  if (isRunner(words[0])) return runnerReads(words.slice(1), readsOf)
+  if (words.slice(1).some(isRunner) && (words[0] === null || WRAPPERS.includes(String(words[0]).split(/[\\/]/).pop().replace(/\.exe$/i, '')))) {
     return [unknown('something runs keychain-env in a way secret-box can\'t follow')]
   }
-  const read = readOf(words)
+  const read = readsOf(words)
   return read ? [read] : []
 }
 
 // keychain-env [--env-file PATH]... -- COMMAND: the .env files it resolves
 // (./.env when none is named), then whatever COMMAND reads in turn. Anything
 // else is what the runner itself refuses.
-function runnerReads(args) {
+function runnerReads(args, readsOf) {
   const envFiles = []
   for (let k = 0; k < args.length; k++) {
     const a = args[k]
     if (a === null) return [unknowable]
-    if (a === '--') return [{ envFiles: envFiles.length ? envFiles : ['.env'] }, ...commandReads(args.slice(k + 1))]
+    if (a === '--') return [{ envFiles: envFiles.length ? envFiles : ['.env'] }, ...commandReads(args.slice(k + 1), readsOf)]
     if (a === '--env-file' && typeof args[k + 1] === 'string') envFiles.push(args[++k])
     else if (a.startsWith('--env-file=')) envFiles.push(a.slice('--env-file='.length))
     else return [a === '--env-file' ? unknowable : unknown(`keychain-env is given ${a}`)]
@@ -446,6 +457,47 @@ function readOf(words) {
   // A relative path is found from the shell's folder, which the hook can't see
   if (keychains.some((f) => !f.startsWith('/'))) return unknown('it names a keychain file by a relative path')
   return { kind, criteria, keychains }
+}
+
+// What one simple command reads from Windows Credential Manager: nothing
+// (undefined), a read, or { unknown }. A read is bin/credman, or credman.ps1
+// run by Windows PowerShell, with `get` and its -s/-Service and -a/-Account
+// (PowerShell takes any prefix of a parameter's name, and -Name:value). `read`
+// takes its names on stdin, which can't be known. The other commands print
+// names at most.
+const POWERSHELL = /^(?:.*[\\/])?(?:powershell|pwsh)(?:\.exe)?$/i
+function credmanReadOf(words) {
+  const at = words.findIndex(isCredman)
+  if (at < 0) return undefined
+  const before = words.slice(0, at)
+  if (before.includes(null)) return unknown('something other than credman runs it')
+  // `cat bin/credman`, `grep credman`: the script is only named
+  if (before.length && !POWERSHELL.test(before[0])) return undefined
+  const sub = words[at + 1]
+  if (sub === null) return unknowable
+  if (typeof sub !== 'string') return undefined
+  if (/^read$/i.test(sub)) return unknown('it reads which item from its input')
+  if (!/^get$/i.test(sub)) return undefined
+  let service
+  let account
+  const args = words.slice(at + 2)
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k]
+    if (a === null) return unknowable
+    const m = /^-([A-Za-z]+)(?::(.*))?$/.exec(a)
+    if (!m) return unknown(`credman is given ${a}`)
+    const flag = m[1].toLowerCase()
+    const isService = flag === 's' || 'service'.startsWith(flag)
+    const isAccount = flag === 'a' || 'account'.startsWith(flag)
+    if (!isService && !isAccount) return unknown(`it uses -${m[1]}`)
+    const value = m[2] !== undefined ? m[2] : args[++k]
+    if (value === undefined) return unknown(`its -${m[1]} has no value`)
+    if (value === null) return unknowable
+    if (isService) service = value
+    else account = value
+  }
+  if (!service) return undefined
+  return { kind: 'credman', service, ...(account ? { account } : {}) }
 }
 
 // Splits a command into the words of each simple command, the way zsh and
