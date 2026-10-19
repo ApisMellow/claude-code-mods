@@ -12,3 +12,4 @@ Read this when `use_secret` reports a value that can't go into a Bash command, o
   `printf '%s' PLACEHOLDER | base64 -d | ssh-add -`
 - A `.env` pointer to that item gives the app the base64 text. The app decodes it.
 - Only the base64 text is hidden in output. Never let the decoded value print.
+- On Windows the `security` commands above do not exist. The user saves the base64 text with the `credman.ps1 add` command (see `windows.md`), pasting it at the hidden prompt; a value holds at most 2560 bytes, so a large PEM key may not fit. Decoding works the same in the Bash tool.

@@ -1,6 +1,6 @@
 # secret-box
 
-A Claude Code mod that lets Claude use a secret without ever seeing it. When Claude needs an API key, it calls a `request_secret` tool, a masked box opens, you paste the key, and the mod saves it to the macOS Keychain (or, with `backend: dotenv`, to `.env`). A key already in the Keychain is loaded with `use_secret`. The Keychain parts are macOS only; elsewhere the box writes `.env` as it always did. Claude gets a placeholder like `[REDACTED-SECRET-3f9a1c2e]` instead of the value, and the placeholder turns into the real key whenever a tool runs. Any key a tool prints comes back to Claude as a placeholder, and committing `.env` is refused.
+A Claude Code mod that lets Claude use a secret without ever seeing it. When Claude needs an API key, it calls a `request_secret` tool, a masked box opens, you paste the key, and the mod saves it to the macOS Keychain or Windows Credential Manager (or, with `backend: dotenv`, to `.env`). A key already there is loaded with `use_secret`. The vault parts work on macOS and Windows; elsewhere the box writes `.env` as it always did. Claude gets a placeholder like `[REDACTED-SECRET-3f9a1c2e]` instead of the value, and the placeholder turns into the real key whenever a tool runs. Any key a tool prints comes back to Claude as a placeholder, and committing `.env` is refused.
 
 ![secret-box: on the left Claude calls secret-box - request_secret for STRIPE_SECRET_KEY and waits; on the right the secret box pane asks for STRIPE_SECRET_KEY with the reason, and the value field shows only dots; below, the four steps: Claude calls a tool, you paste into a masked box, the mod writes .env and .gitignore (the dotenv backend, shown here; on macOS the default saves to the Keychain instead), Claude gets a placeholder that turns into the key when a tool runs](screenshot.png)
 
@@ -86,9 +86,36 @@ Some reads can't be pinned to one item or hidden. By default these run as writte
 - An item another app created may make macOS ask whether `security` can read it. Allow it, or the read fails and Claude is told the item could not be read.
 - A Keychain value under 8 characters is restored into commands, but it can't be hidden where it turns up later. A direct `-w` read of such a value prints it in the clear, into the transcript (the same limit as `.env`).
 
-## .env pointers and keychain-env (macOS)
+## Credential Manager backend (Windows)
 
-A `.env` file can name Keychain items instead of holding keys. A pointer is the value `keychain:SERVICE`, or `keychain:SERVICE?account=ACCOUNT`:
+On Windows the same flow runs on Windows Credential Manager, which every Windows 10 and 11 has: nothing to install but [Git for Windows](https://gitforwindows.org), which Claude Code's Bash tool already needs. With `backend: auto` the box saves a key there as a generic credential: the name Claude asked for is the credential's target name (the service), your Windows user name is its user name (the account), and the comment `secret-box` tags it for `list_key_names`. `.env` pointers, `keychain-env`, `use_secret`, `list_key_names`, `migrate_env_to_keychain`, the commit guard and the masking of direct reads all work as on macOS, and the pointer syntax is the same `keychain:` on both, so one `.env` file serves a team on both systems. The mod knows it is on Windows from the `OS` variable.
+
+The mod reads and writes items with [`bin/credman.ps1`](bin/credman.ps1), run under Windows PowerShell 5.1 by its full path (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, so no `powershell.exe` earlier on `PATH` is handed a key), with `-ExecutionPolicy Bypass` for that one process. The service, the account and the value go in on stdin as hex, never in the command line, where any process of yours could read them. Each call takes about a third of a second.
+
+**Use the Bash tool.** A placeholder becomes the real value only in the Bash tool, which on Windows is Git Bash: the redactor's rules for what may safely go into a command are Bash's. A PowerShell command that holds a placeholder is refused, with a note to Claude to run it in Bash instead; left to run, it would use the placeholder's own text. PowerShell output is still masked, `.env` files it reads are still learned, and `git add .env` from PowerShell is still refused.
+
+**Adding a key by hand.** In your own terminal window (not at Claude's prompt with `!`, which has no terminal to prompt in):
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\secret-box\bin\credman.ps1" add -Service OPENAI_API_KEY
+```
+
+It prompts for the value with the typing hidden, saves it under your Windows user name and tags it. Add `-Account NAME` for another account. `cmdkey /generic:OPENAI_API_KEY /user:%USERNAME% /pass` works too (it prompts when `/pass` has no value), but leaves the item untagged, so `list_key_names` shows it only through `listPrefixes`. `credman.ps1 delete -Service NAME` removes one. Claude gives you the exact path.
+
+**How Claude asks for it.** `use_secret NAME` reads the item and answers with a placeholder. For a value with a space or a shell character, Claude gets `"$(C:/path/to/secret-box/bin/credman get -s NAME)"` to put where the value goes: [`bin/credman`](bin/credman) is a Git Bash script that runs `credman.ps1 get`, which prints a printable value as it is and refuses anything else. If Claude runs `bin/credman get` (or `credman.ps1 get`) itself, in Bash or PowerShell, the mod reads the same item first and hides what the command prints, as with `security` on macOS. Reads it can't pin down follow `refuseUnmaskable`.
+
+**Differences from the Keychain:**
+
+- **No access prompt.** macOS asks before an app reads an item another app made. Credential Manager asks no one: any process running as you can read every generic credential. This fits the threat model (keys out of transcripts and plaintext files, not a wall against the agent or your own programs), but it is weaker than the Keychain.
+- **One account per service.** A target name is unique, so variants of one key (personal, work) need different services (`openai`, `openai/work`), not different accounts. Saving a service that is held under another account is refused rather than overwritten; a pointer's `?account=` must match the item's user name.
+- **2560 bytes per value** (Credential Manager's limit). The mod stores UTF-16LE as `cmdkey` does, or UTF-8 for an ASCII value too long for that, and reads both, so items other tools wrote in either encoding read as they are.
+- **Line endings.** `bin/keychain-env` and `bin/credman` are bash scripts; `.gitattributes` keeps them LF on a checkout with `core.autocrlf` on, which Git for Windows sets by default.
+- **Managed machines.** Where device policy (AppLocker, WDAC) puts PowerShell in Constrained Language Mode, `credman.ps1` can't load its Credential Manager calls, and where Group Policy sets the execution policy, `-ExecutionPolicy Bypass` is overridden and the script won't run. Either way every read fails with a plain error; set `backend` to `dotenv` there.
+- Paths Claude is given use forward slashes (`C:/Users/…/bin/keychain-env`), which Git Bash takes and a backslash path would not survive. The allow rule for the runner is `Bash(C:/path/to/secret-box/bin/keychain-env:*)`.
+
+## .env pointers and keychain-env (macOS and Windows)
+
+A `.env` file can name Keychain items (on Windows, Credential Manager items) instead of holding keys. A pointer is the value `keychain:SERVICE`, or `keychain:SERVICE?account=ACCOUNT`:
 
 ```
 # .env: safe to commit, it holds no key
@@ -123,7 +150,7 @@ Names: a key one project uses gets service `PROJECTDIR/ENV_NAME`. A key shared a
 
 `keychain-env` handles single-line values only. A value `security -w` prints as hex (one with a newline, a tab or a non-ASCII character) is refused; store such a value base64-encoded, as under Keychain backend.
 
-## list_key_names (macOS)
+## list_key_names (macOS and Windows)
 
 `list_key_names` returns key names only and never fetches or returns any key's value. It lists:
 
@@ -133,7 +160,7 @@ Names: a key one project uses gets service `PROJECTDIR/ENV_NAME`. A key shared a
 
 It never lists the whole keychain. It reads the names with `security dump-keychain` (without `-d`, which would include passwords), filters them inside the mod, and never returns the raw output. To make an existing item show up, re-save it with the tag (`security add-generic-password -U -s SERVICE -a ACCOUNT -j secret-box -w`, which prompts for the value again), or set `listPrefixes` to its service's prefix.
 
-## migrate_env_to_keychain (macOS)
+## migrate_env_to_keychain (macOS and Windows)
 
 `migrate_env_to_keychain` moves plaintext keys from one `.env` file into the Keychain. By default it moves every secret-named entry; give `names` to choose. It works on one entry at a time:
 
@@ -180,10 +207,10 @@ Set them with `/plugin configure secret-box@claude-code-mods`, or under `pluginC
 
 | Option | Default | What it does |
 | :- | :- | :- |
-| `backend` | `auto` | Where the box saves: `auto` (the Keychain on macOS, `.env` elsewhere), `keychain` (macOS only; refused elsewhere rather than falling back to a plaintext file) or `dotenv` (the project `.env`) |
-| `keychainAccount` | empty | The account the box saves Keychain items under. Empty means your macOS user name |
-| `listPrefixes` | empty | macOS: service prefixes, comma separated, whose Keychain items `list_key_names` shows beside the ones secret-box saved |
-| `refuseUnmaskable` | `false` | macOS: refuse a Bash command that reads the Keychain in a way the mod can't pin to one item or hide (listed under Keychain backend), instead of letting it run |
+| `backend` | `auto` | Where the box saves: `auto` (the Keychain on macOS, Credential Manager on Windows, `.env` elsewhere), `keychain` (that vault; refused elsewhere rather than falling back to a plaintext file) or `dotenv` (the project `.env`) |
+| `keychainAccount` | empty | The account the box saves Keychain (or Credential Manager) items under. Empty means your macOS user name, or on Windows `%USERNAME%` |
+| `listPrefixes` | empty | macOS and Windows: service prefixes, comma separated, whose Keychain items `list_key_names` shows beside the ones secret-box saved |
+| `refuseUnmaskable` | `false` | macOS and Windows: refuse a Bash command that reads the Keychain (or Credential Manager) in a way the mod can't pin to one item or hide (listed under Keychain backend), instead of letting it run |
 | `secrets` | `true` | Hide secrets in tool output and prompts |
 | `pii` | `false` | Hide email addresses and public IP addresses |
 | `hideEmails` | `true` | With `pii` on, also hide emails; turn off to hide only IPs |
@@ -241,7 +268,9 @@ node --experimental-strip-types tests/detect.test.mts
 
 `tests/secret-box.test.ts` covers the guard, `.env` values and the round trip from placeholder to value. `tests/keychain.test.ts` covers `use_secret`, the parser for Keychain reads in Bash (including two items sharing a service), both backends of the box and both platforms. `tests/keychain-v2.test.ts` covers pointers, `keychain-env`'s pre-load, the commit guard, `list_key_names`, `migrate_env_to_keychain` and the once-per-session note. `tests/own-approval.test.ts` covers each branch of the permission check for calls the mod filled, under both `ownPrompt` settings and in each permission mode. `tests/keychain-v3.test.ts` covers placeholders from before a reload, errored answers, the one-line answers of secret-box's tools and the rows drawn for its refusals. The keychain tests use `tests/fake-mac.ts`, a fake `security` that prints what the real one does. `bin/keychain-env` is checked against the real Keychain. `tests/detect.test.mts` is transcript-redactor's detector test: 174 values that must be hidden and 114 that must be kept.
 
-Tested with Claude Code 2.1.296.
+`tests/credman.test.ts` covers the Windows backend through `tests/fake-win.ts`, a fake Windows whose fake `credman.ps1` answers with the real one's exit codes and output shapes: the tools and their wording, use_secret and the box with nothing but hex on stdin and no value or name in argv, the `bin/credman get` read form, list_key_names, migration (the service from a `C:` folder), the commit guard, the PowerShell guard, and the pre-load of a `credman get` in Bash or PowerShell, with a table for the Windows command parser. `bin/credman.ps1` and `bin/keychain-env` are checked against the real Credential Manager. On Windows, run the suite from Git Bash with `claude plugin test .`.
+
+Tested with Claude Code 2.1.296 on macOS, and 2.1.303 on Windows 11 (Windows PowerShell 5.1, Git for Windows 2.55).
 
 ## Original redactor contributions
 

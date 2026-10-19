@@ -30,7 +30,7 @@ Answer `y` to add the marketplace, then pick a scope. Or add the marketplace onc
 | [jev-skill-suggestion](plugins/jev-skill-suggestion) | Scores every skill against your prompt with TypeSafe Jev as you type. Observe, block or steer which skill loads. |
 | [memory-fork](plugins/memory-fork) | Keeps auto-memory up to date in the background: after each turn Haiku decides whether memory needs a change, and a tool-less fork of the session drafts it. |
 | [prompt-bouncer](plugins/prompt-bouncer) | Bounces vague prompts before Claude sees them, and suggests the project's own term. |
-| [secret-box](plugins/secret-box) | Claude uses a secret without seeing it: a masked box saves keys to `.env`, Claude gets a placeholder, and committing `.env` is refused. |
+| [secret-box](plugins/secret-box) | Claude uses a secret without seeing it: a masked box saves keys to the macOS Keychain or Windows Credential Manager (or `.env`), Claude gets a placeholder, and committing a `.env` with keys is refused. |
 | [transcript-redactor](plugins/transcript-redactor) | Keeps secrets out of the session transcript: each one becomes a stable placeholder, and the real value goes back in on the way into a tool call. |
 | [vercel-deploy-status](plugins/vercel-deploy-status) | Pins the Vercel deploy queue of the linked project under the prompt, with each deploy's phase and elapsed time. |
 

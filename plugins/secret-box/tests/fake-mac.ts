@@ -118,7 +118,13 @@ export type Opts = {
   clock?: { sleep: (ms: number) => Promise<void> }
 }
 
-const inFolder = (path: string) => (path.startsWith(`${CWD}/`) ? path.slice(CWD.length + 1) : path)
+// On Windows core hands the fs mocks the path resolved (C:\repo\.env), so a
+// path is read with its drive taken off and its separators made /
+export const unixPath = (path: string) => String(path).replace(/^[A-Za-z]:(?=[\\/])/, '').replace(/\\/g, '/')
+const inFolder = (raw: string) => {
+  const path = unixPath(raw)
+  return path.startsWith(`${CWD}/`) ? path.slice(CWD.length + 1) : path
+}
 
 // Stand in for the Mac beneath the mod
 export function mac(on: any, opts: Opts = {}) {
@@ -176,7 +182,7 @@ export function mac(on: any, opts: Opts = {}) {
   on('session.cwd', () => ({ value: CWD }))
   on('fs.list', () => ({ value: Object.keys(files).map((name) => ({ name, kind: 'file', size: files[name]!.length })) }))
   on('fs.exists', (_$: unknown, e: { path: string }) => {
-    if (e.path === MACOS_VERSION_FILE) return opts.versionFile === 'fails' ? { deny: 'not allowed' } : { value: opts.versionFile === 'present' }
+    if (unixPath(e.path) === MACOS_VERSION_FILE) return opts.versionFile === 'fails' ? { deny: 'not allowed' } : { value: opts.versionFile === 'present' }
     return { value: inFolder(e.path) in files }
   })
   on('fs.read', (_$: unknown, e: { path: string }) => {
@@ -184,7 +190,7 @@ export function mac(on: any, opts: Opts = {}) {
     return name in files ? { value: files[name] } : { deny: `ENOENT: ${e.path}` }
   })
   on('fs.write', (_$: unknown, e: { path: string; text: string }) => {
-    opts.writes?.push({ path: e.path, text: e.text })
+    opts.writes?.push({ path: unixPath(e.path), text: e.text })
     files[inFolder(e.path)] = e.text
     return { value: undefined }
   })

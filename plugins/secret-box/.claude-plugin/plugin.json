@@ -1,7 +1,7 @@
 {
   "name": "secret-box",
-  "version": "0.5.0-keychain.1",
-  "description": "Claude can use a secret without seeing it: a masked box saves keys to the macOS Keychain (or .env) and gives Claude a placeholder, use_secret loads a Keychain item as a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
+  "version": "0.6.0-windows.1",
+  "description": "Claude can use a secret without seeing it: a masked box saves keys to the macOS Keychain or Windows Credential Manager (or .env) and gives Claude a placeholder, use_secret loads a stored item as a placeholder, every key a tool prints comes back as a placeholder, and committing .env is refused",
   "author": {
     "name": "Ray Amjad",
     "url": "https://github.com/ray-amjad"
@@ -12,26 +12,26 @@
     "backend": {
       "type": "string",
       "title": "Where the box saves",
-      "description": "auto: the macOS Keychain on a Mac, the project .env elsewhere. keychain saves to the Keychain (service = the name, nothing written to .env; macOS only); dotenv writes the project .env as before",
+      "description": "auto: the macOS Keychain on a Mac, Windows Credential Manager on Windows, the project .env elsewhere. keychain saves to that vault (service = the name, nothing written to .env; macOS and Windows only); dotenv writes the project .env as before",
       "options": ["auto", "keychain", "dotenv"],
       "default": "auto"
     },
     "refuseUnmaskable": {
       "type": "boolean",
       "title": "Refuse Keychain reads it can't hide",
-      "description": "macOS: refuse a Bash command that reads the Keychain in a way secret-box can't pin to one item or hide (a variable, sudo, dump-keychain, security -i, a value under 8 characters). Off, the command runs and only the detector scans its output",
+      "description": "macOS and Windows: refuse a Bash command that reads the Keychain (or Credential Manager) in a way secret-box can't pin to one item or hide (a variable, sudo, dump-keychain, security -i, a value under 8 characters). Off, the command runs and only the detector scans its output",
       "default": false
     },
     "listPrefixes": {
       "type": "string",
       "title": "Keychain services list_key_names may show",
-      "description": "macOS: service-name prefixes, separated by commas (myapp/,openai). list_key_names shows the names of Keychain items whose service starts with one, beside the items secret-box saved. Empty: only those",
+      "description": "macOS and Windows: service-name prefixes, separated by commas (myapp/,openai). list_key_names shows the names of Keychain or Credential Manager items whose service starts with one, beside the items secret-box saved. Empty: only those",
       "default": ""
     },
     "keychainAccount": {
       "type": "string",
       "title": "Keychain account",
-      "description": "The account the box saves Keychain items under. Empty means your macOS user name",
+      "description": "The account the box saves Keychain (or Credential Manager) items under. Empty means your macOS user name ($USER), or on Windows your Windows user name (%USERNAME%)",
       "default": ""
     },
     "secrets": {
