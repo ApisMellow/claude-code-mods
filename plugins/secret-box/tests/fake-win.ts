@@ -88,9 +88,14 @@ export function win(on: any, opts: WinOpts = {}) {
   const files = (opts.files ??= {})
   const cwd = opts.cwd ?? CWD
   const folder = unixPath(cwd).replace(/\/+$/, '')
-  // Core hands the fs mocks the path resolved (C:\repo\.env): drive off, separators /
+  // Core hands the fs mocks the path it resolved on the host. On Windows that
+  // is C:\repo\.env. A Mac or Linux host takes a drive-letter folder for a
+  // relative one and puts its own folder first
+  // (/x/secret-box/C:\Users\tester\dev\myapp/.env), so that prefix comes off.
+  // Then the drive comes off and the separators become /.
+  const hostPath = (raw: string) => unixPath(String(raw).replace(/^\/(?:[^/]*\/)*?(?=[A-Za-z]:[\\/])/, ''))
   const inFolder = (raw: string) => {
-    const path = unixPath(raw)
+    const path = hostPath(raw)
     return path.toLowerCase().startsWith(`${folder.toLowerCase()}/`) ? path.slice(folder.length + 1) : path
   }
   on('process.run', async (_$: unknown, e: { argv: string[]; init?: { stdin?: string } }) => {
@@ -142,7 +147,7 @@ export function win(on: any, opts: WinOpts = {}) {
     return name in files ? { value: files[name] } : { deny: `ENOENT: ${e.path}` }
   })
   on('fs.write', (_$: unknown, e: { path: string; text: string }) => {
-    opts.writes?.push({ path: unixPath(e.path), text: e.text })
+    opts.writes?.push({ path: hostPath(e.path), text: e.text })
     files[inFolder(e.path)] = e.text
     return { value: undefined }
   })

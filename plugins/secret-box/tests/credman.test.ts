@@ -3,6 +3,7 @@
 // tests/fake-win.ts; no test here runs the real credman.ps1.
 import { expect, mock, test } from 'claude-code/testing'
 
+import { bashPath, credAddHint, credmanArgv, credmanCommand as credmanPath, credmanScript, credReadCommand } from '../hooks/credman'
 import { keychainReads } from '../hooks/keychain'
 import {
   BOX, call, credmanCalls, credmanCommand, CWD, hex, hexOf, LIST, MIGRATE, POWERSHELL, registeredWin, TAG, USE, win,
@@ -14,8 +15,17 @@ const NAMES_ONLY = "Returns key names only and never fetches or returns any key'
 const STALE = '[REDACTED-SECRET-0badc0de]'
 // A Stripe-shaped fake key the detector hides on sight, built at run time
 const STRIPE = 'sk_' + 'live_' + 'W1n2D3o4W5s6K7e8Y9z0A1b2'
-// bin/credman by the path Git Bash takes: a drive, then forward slashes only
-const CREDMAN = /[A-Za-z]:\/[^\\\s"]*\/bin\/credman/
+// The mod's folder is the host's own ($.plugin.root, which a test can't set):
+// C:\Users\...\secret-box on Windows, /Users/.../secret-box on a Mac. So the
+// paths the mod builds on it are matched by shape, with a drive only where the
+// host has one. 'the paths built on a Windows folder' below pins each one
+// exactly, built on a Windows folder, on any host.
+// bin/credman by the path Git Bash takes: absolute, forward slashes only
+const CREDMAN = /(?:[A-Za-z]:)?\/[^\\\s"]*\/bin\/credman/
+// bin/keychain-env the same way
+const RUNNER = /(?:[A-Za-z]:)?\/[^\\\s"]*\/bin\/keychain-env/
+// credman.ps1 by the path powershell.exe -File takes: the folder, then \bin\credman.ps1
+const CREDMAN_PS1 = /(?:[A-Za-z]:\\|\/)[^"]*\\bin\\credman\.ps1/
 const U = 'unknown'
 
 // What credman.ps1 reads on stdin: each name, and the value for set, as hex of its UTF-8
@@ -64,7 +74,7 @@ test('use_secret answers with a placeholder, and the names and value go over std
   expect((r.context ?? []).join('\n')).toContain('Use the Bash tool (Git Bash) for that command: PowerShell gets no real values.')
   const [argv] = credmanCalls(opts.argvs!)
   expect(argv).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', argv![6], 'read', '-Stdin'])
-  expect(argv![6]).toMatch(/^[A-Za-z]:\\.*\\bin\\credman\.ps1$/)
+  expect(argv![6]).toMatch(new RegExp(`^${CREDMAN_PS1.source}$`))
   // No account given: an empty second line, so any account matches
   expect(opts.stdins).toEqual([stdinOf('OPENAI_API_KEY', '')])
   expect(argvText(opts)).not.toContain('OPENAI_API_KEY')
@@ -133,7 +143,7 @@ test('a missing item answers with the credman.ps1 add command, to run in their o
   const r = String((await call($, { tool: USE, service: 'NEW_KEY' })).result)
   expect(r).toContain('No Credential Manager item has the service NEW_KEY.')
   expect(r).toContain('in their own terminal window (not through Claude, and not with !)')
-  expect(r).toMatch(/\npowershell -NoProfile -ExecutionPolicy Bypass -File "[A-Za-z]:\\[^"]*\\bin\\credman\.ps1" add -Service NEW_KEY -Account tester\n/)
+  expect(r).toMatch(new RegExp(`\\npowershell -NoProfile -ExecutionPolicy Bypass -File "${CREDMAN_PS1.source}" add -Service NEW_KEY -Account tester\\n`))
   expect(r).not.toMatch(TAG)
   const named = String((await call($, { tool: USE, service: 'my key', account: 'work' })).result)
   expect(named).toContain('credman.ps1" add -Service "my key" -Account work')
@@ -161,7 +171,7 @@ test('use_secret: a .env pointer names the item, read through credman', async ($
   win(on, opts)
   const answer = await call($, { tool: USE, service: 'OPENAI_API_KEY' })
   expect(String(answer.result)).toContain('Loaded openai (account work) from Credential Manager through the OPENAI_API_KEY pointer in .env')
-  expect((answer.context ?? []).join('\n')).toMatch(/[A-Za-z]:\/[^\\\s"]*\/bin\/keychain-env -- COMMAND/)
+  expect((answer.context ?? []).join('\n')).toMatch(new RegExp(`${RUNNER.source} -- COMMAND`))
   expect(opts.stdins).toEqual([stdinOf('openai', 'work')])
   expect(await restored($, opts, { service: 'OPENAI_API_KEY' })).toBe(hex(7))
 })
@@ -511,4 +521,32 @@ for (const [name, command, reads] of WIN_READS) {
 
 test('keychainReads off Windows takes a credman command for nothing', async () => {
   expect(keychainReads('C:/x/bin/credman get -s svc', {})).toEqual([])
+})
+
+// ------------------------------------------- the paths, on a Windows folder
+
+// $.plugin.root as Windows gives it. credman.js builds every path on it by
+// text alone, so these hold on any host.
+const WIN_ROOT = 'C:\\Users\\tester\\.claude\\plugins\\secret-box'
+
+test('the paths built on a Windows folder: credman.ps1 with backslashes, bin/credman and keychain-env as Git Bash takes them', async () => {
+  const ps1 = 'C:\\Users\\tester\\.claude\\plugins\\secret-box\\bin\\credman.ps1'
+  const sh = 'C:/Users/tester/.claude/plugins/secret-box/bin/credman'
+  for (const root of [WIN_ROOT, `${WIN_ROOT}\\`]) {
+    expect(credmanScript(root)).toBe(ps1)
+    expect(credmanPath(root)).toBe(sh)
+  }
+  expect(bashPath(WIN_ROOT)).toBe('C:/Users/tester/.claude/plugins/secret-box')
+  const env = { env: { get: async (name: string) => (name === 'SystemRoot' ? 'C:\\Windows' : undefined) } }
+  expect(await credmanArgv(env, WIN_ROOT, 'read')).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, 'read', '-Stdin'])
+  expect(credAddHint(WIN_ROOT, 'NEW_KEY', 'tester')).toBe(`powershell -NoProfile -ExecutionPolicy Bypass -File "${ps1}" add -Service NEW_KEY -Account tester`)
+  const read = credReadCommand(WIN_ROOT, "Bob's site", 'bob')
+  expect(read).toBe(`"$(${sh} get -s 'Bob'\\''s site' -a bob)"`)
+  expect(keychainReads(`printf '%s' ${read} | tee out.txt`, {}, { windows: true })).toEqual([{ kind: 'credman', service: "Bob's site", account: 'bob' }])
+  // The shapes the tests above match the host's paths by take these forms, and
+  // not bin/credman with a backslash
+  expect(sh).toMatch(new RegExp(`^${CREDMAN.source}$`))
+  expect(`${bashPath(WIN_ROOT)}/bin/keychain-env`).toMatch(new RegExp(`^${RUNNER.source}$`))
+  expect(ps1).toMatch(new RegExp(`^${CREDMAN_PS1.source}$`))
+  expect(`${WIN_ROOT}\\bin\\credman`).not.toMatch(new RegExp(`^${CREDMAN.source}$`))
 })
